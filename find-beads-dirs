@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ $# -eq 0 ]; then
+    echo "Usage: $0 <directory>"
+    exit 1
+fi
+
+target_dir="$1"
+
+if [ ! -d "$target_dir" ]; then
+    echo "Error: '$target_dir' is not a directory"
+    exit 1
+fi
+
+find "$target_dir" -mindepth 1 -maxdepth 1 -type d -print0 | while IFS= read -r -d '' subdir; do
+    if [ -d "$subdir/.beads" ]; then
+        if [ -f "$subdir/.beads"/*.db ] || [ -f "$subdir/.beads/issues.jsonl" ]; then
+            echo "$subdir"
+        fi
+    fi
+done
