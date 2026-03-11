@@ -10,6 +10,7 @@ Indexes transcript files from `~/.claude`, `~/.claude-gp`, `~/.codex`, and `~/.f
 The UI supports:
 - bookmarking sessions for manual review later
 - copying the correct per-agent resume command
+- permanently hiding transcripts so later ingests do not bring them back
 - stripping known Codex `AGENTS.md` onboarding boilerplate from the displayed prompt text
 
 Examples:

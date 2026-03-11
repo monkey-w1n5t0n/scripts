@@ -122,9 +122,44 @@ with urllib.request.urlopen(base + "/api/sessions?days=30&limit=10&review_only=1
     review_only = json.load(response)
 assert len(review_only["sessions"]) == 1
 assert review_only["sessions"][0]["agent"] == "codex"
+
+request = urllib.request.Request(
+    base + "/api/hide-session",
+    data=json.dumps({"session_key": sessions["factory"]["session_key"]}).encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(request) as response:
+    hidden = json.load(response)
+assert hidden["hidden"] is True
+
+with urllib.request.urlopen(base + "/api/sessions?days=30&limit=10") as response:
+    remaining = json.load(response)
+assert {item["agent"] for item in remaining["sessions"]} == {"claude", "codex"}
 PY
 
 kill "$server_pid" 2>/dev/null || true
 trap 'rm -rf "$tmpdir"' EXIT
+
+"$SCRIPT" \
+	--db-path "$db_path" \
+	--root "claude=$tmpdir/claude" \
+	--root "claude-gp=$tmpdir/claude-gp" \
+	--root "codex=$tmpdir/codex" \
+	--root "factory=$tmpdir/factory" \
+	ingest >/dev/null
+
+python3 - "$db_path" <<'PY'
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+conn.row_factory = sqlite3.Row
+
+agents = {row["agent"] for row in conn.execute("SELECT agent FROM sessions")}
+assert agents == {"claude", "codex"}, agents
+hidden_count = conn.execute("SELECT COUNT(*) FROM hidden_sources").fetchone()[0]
+assert hidden_count == 1, hidden_count
+PY
 
 echo "PASS: agent-chat-audit ingests representative session files"

@@ -455,6 +455,11 @@ def connect_db(db_path: Path) -> sqlite3.Connection:
             FOREIGN KEY (session_key) REFERENCES sessions(session_key) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS hidden_sources (
+            source_path TEXT PRIMARY KEY,
+            hidden_at TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent);
         CREATE INDEX IF NOT EXISTS idx_messages_session_key ON messages(session_key, ordinal DESC);
@@ -541,12 +546,25 @@ def remove_missing_sources(conn: sqlite3.Connection, discovered_paths: set[str])
     return removed
 
 
+def delete_session_by_source(conn: sqlite3.Connection, source_path: str) -> None:
+    session = conn.execute("SELECT session_key FROM sessions WHERE source_path = ?", (source_path,)).fetchone()
+    if session:
+        conn.execute("DELETE FROM review_later WHERE session_key = ?", (session["session_key"],))
+        conn.execute("DELETE FROM messages WHERE session_key = ?", (session["session_key"],))
+        conn.execute("DELETE FROM sessions WHERE session_key = ?", (session["session_key"],))
+    conn.execute("DELETE FROM source_files WHERE path = ?", (source_path,))
+
+
 def ingest(db_path: Path, roots: dict[str, Path], days: int | None, verbose: bool = False) -> dict[str, int]:
     conn = connect_db(db_path)
+    hidden_sources = {row["source_path"] for row in conn.execute("SELECT source_path FROM hidden_sources")}
     discovered: list[tuple[str, Path]] = []
     for agent, root in roots.items():
         for path in discover_files(agent, root):
             if not within_days(path, days):
+                continue
+            if str(path) in hidden_sources:
+                delete_session_by_source(conn, str(path))
                 continue
             discovered.append((agent, path))
 
@@ -650,7 +668,8 @@ def query_sessions(
         SELECT sessions.*, review_later.marked_at AS review_later_marked_at
         FROM sessions
         LEFT JOIN review_later ON review_later.session_key = sessions.session_key
-        WHERE {' AND '.join(clauses)}
+        LEFT JOIN hidden_sources ON hidden_sources.source_path = sessions.source_path
+        WHERE hidden_sources.source_path IS NULL AND {' AND '.join(clauses)}
         ORDER BY {order}
         LIMIT ?
     """
@@ -688,7 +707,9 @@ def query_session_detail(conn: sqlite3.Connection, session_key: str) -> dict[str
         SELECT sessions.*, review_later.marked_at AS review_later_marked_at
         FROM sessions
         LEFT JOIN review_later ON review_later.session_key = sessions.session_key
+        LEFT JOIN hidden_sources ON hidden_sources.source_path = sessions.source_path
         WHERE sessions.session_key = ?
+          AND hidden_sources.source_path IS NULL
         """,
         (session_key,),
     ).fetchone()
@@ -740,6 +761,24 @@ def set_review_later(conn: sqlite3.Connection, session_key: str, review_later: b
         )
     else:
         conn.execute("DELETE FROM review_later WHERE session_key = ?", (session_key,))
+    conn.commit()
+    return True
+
+
+def hide_session(conn: sqlite3.Connection, session_key: str) -> bool:
+    row = conn.execute("SELECT source_path FROM sessions WHERE session_key = ?", (session_key,)).fetchone()
+    if row is None:
+        return False
+    source_path = row["source_path"]
+    conn.execute(
+        """
+        INSERT INTO hidden_sources(source_path, hidden_at)
+        VALUES (?, ?)
+        ON CONFLICT(source_path) DO UPDATE SET hidden_at=excluded.hidden_at
+        """,
+        (source_path, utc_now()),
+    )
+    delete_session_by_source(conn, source_path)
     conn.commit()
     return True
 
@@ -998,6 +1037,10 @@ HTML_PAGE = textwrap.dedent(
           background: var(--accent-soft);
           color: var(--accent);
         }
+        .button-danger {
+          border-color: rgba(161, 36, 36, 0.3);
+          color: var(--bad);
+        }
         button, .link-button {
           border: 1px solid var(--line);
           border-radius: 999px;
@@ -1217,6 +1260,7 @@ HTML_PAGE = textwrap.dedent(
                 <button class="${session.review_later ? "button-active" : ""}" data-review="${escapeHtml(session.session_key)}" data-review-value="${session.review_later ? "0" : "1"}">
                   ${session.review_later ? "Unmark review later" : "Review later"}
                 </button>
+                <button class="button-danger" data-hide="${escapeHtml(session.session_key)}">Hide permanently</button>
                 <button data-toggle="${escapeHtml(session.session_key)}">Show tail</button>
                 <a class="link-button" href="/api/raw?session_key=${encodeURIComponent(session.session_key)}" target="_blank" rel="noreferrer">Raw transcript</a>
               </div>
@@ -1339,6 +1383,19 @@ HTML_PAGE = textwrap.dedent(
           await loadSessions();
         }
 
+        async function hideSession(sessionKey) {
+          const response = await fetch("/api/hide-session", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_key: sessionKey }),
+          });
+          if (!response.ok) {
+            throw new Error(`Failed to hide session: ${response.status}`);
+          }
+          state.detailCache.delete(sessionKey);
+          await loadSessions();
+        }
+
         document.addEventListener("click", async event => {
           const copyButton = event.target.closest("button[data-copy]");
           if (copyButton) {
@@ -1351,6 +1408,16 @@ HTML_PAGE = textwrap.dedent(
             const sessionKey = reviewButton.getAttribute("data-review");
             const reviewLater = reviewButton.getAttribute("data-review-value") === "1";
             await toggleReviewLater(sessionKey, reviewLater);
+            return;
+          }
+
+          const hideButton = event.target.closest("button[data-hide]");
+          if (hideButton) {
+            const sessionKey = hideButton.getAttribute("data-hide");
+            const confirmed = window.confirm("Hide this chat permanently from future ingests?");
+            if (confirmed) {
+              await hideSession(sessionKey);
+            }
             return;
           }
 
@@ -1435,7 +1502,7 @@ def make_handler(db_path: Path, default_days: int):
 
         def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
-            if parsed.path != "/api/review-later":
+            if parsed.path not in {"/api/review-later", "/api/hide-session"}:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
                 return
 
@@ -1447,13 +1514,21 @@ def make_handler(db_path: Path, default_days: int):
                 return
 
             session_key = str(payload.get("session_key", ""))
-            review_later = bool(payload.get("review_later"))
             with connect_db(db_path) as conn:
-                updated = set_review_later(conn, session_key, review_later)
-                if not updated:
+                if parsed.path == "/api/review-later":
+                    review_later = bool(payload.get("review_later"))
+                    updated = set_review_later(conn, session_key, review_later)
+                    if not updated:
+                        self.send_error(HTTPStatus.NOT_FOUND, "Session not found")
+                        return
+                    self.send_json({"session_key": session_key, "review_later": review_later})
+                    return
+
+                hidden = hide_session(conn, session_key)
+                if not hidden:
                     self.send_error(HTTPStatus.NOT_FOUND, "Session not found")
                     return
-            self.send_json({"session_key": session_key, "review_later": review_later})
+                self.send_json({"session_key": session_key, "hidden": True})
 
         def log_message(self, format: str, *args: Any) -> None:
             return
