@@ -1,0 +1,1323 @@
+#!/usr/bin/env python3
+"""Index local agent transcripts and serve a browser UI for unfinished chats."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import html
+import json
+import os
+import re
+import sqlite3
+import sys
+import textwrap
+import urllib.parse
+import webbrowser
+from dataclasses import dataclass
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Iterable
+
+
+DEFAULT_DB_PATH = Path.home() / ".local" / "state" / "agent-chat-audit" / "index.sqlite"
+DEFAULT_PORT = 8421
+DEFAULT_DAYS = 7
+
+
+ATTENTION_PATTERNS = [
+    ("asked_question", re.compile(r"\?$")),
+    ("waiting_for_feedback", re.compile(r"\b(feedback|what would you like|let me know|which do you want)\b")),
+    ("needs_confirmation", re.compile(r"\b(confirm|confirmation|approve|approval|shall i|should i|okay to)\b")),
+    ("blocked", re.compile(r"\b(blocked|can't proceed|cannot proceed|need access|need input|need you to|unblock)\b")),
+    ("auth_error", re.compile(r"\b(auth|login|401|403|api error|authentication_failed|please run /login)\b")),
+    ("git_follow_up", re.compile(r"\b(commit|push|review|merge|pull request|pr)\b")),
+]
+
+DONE_PATTERNS = [
+    re.compile(r"\b(done|completed|finished|resolved|implemented|tests pass(?:ed)?|pushed|closed)\b"),
+    re.compile(r"\bno further action\b"),
+]
+
+
+@dataclass
+class Message:
+    role: str
+    text: str
+    ts: str
+
+
+@dataclass
+class SessionRecord:
+    session_key: str
+    session_id: str
+    agent: str
+    source_path: str
+    cwd: str
+    started_at: str
+    updated_at: str
+    title: str
+    first_user_message: str
+    last_user_message: str
+    last_agent_messages: list[str]
+    message_count: int
+    attention_score: float
+    flags: list[str]
+    messages: list[Message]
+
+
+def default_roots() -> dict[str, Path]:
+    home = Path.home()
+    return {
+        "claude": home / ".claude",
+        "claude-gp": home / ".claude-gp",
+        "codex": home / ".codex",
+        "factory": home / ".factory",
+    }
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def ensure_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                yield obj
+
+
+def normalize_space(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def compact_text(text: str, limit: int = 220) -> str:
+    text = normalize_space(text)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def is_noise_text(text: str) -> bool:
+    if not text:
+        return True
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if stripped in {"Tool loaded.", "TODO List Updated"}:
+        return True
+    if stripped.startswith("<local-command-caveat>"):
+        return True
+    if stripped.startswith("<command-name>"):
+        return True
+    if stripped.startswith("<command-message>"):
+        return True
+    if stripped.startswith("<local-command-stdout>"):
+        return True
+    if stripped.startswith("<system-reminder>") and len(stripped) > 200:
+        return True
+    return False
+
+
+def extract_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            part = extract_text(item)
+            if part:
+                parts.append(part)
+        return "\n".join(parts)
+    if isinstance(value, dict):
+        kind = value.get("type")
+        if kind in {"text", "input_text", "output_text", "summary_text"}:
+            return str(value.get("text", ""))
+        if kind in {"thinking", "tool_use", "tool_reference"}:
+            return ""
+        if kind == "tool_result":
+            content = value.get("content")
+            if isinstance(content, str):
+                return ""
+            return extract_text(content)
+        if "text" in value and isinstance(value["text"], str):
+            return value["text"]
+        if "content" in value:
+            return extract_text(value["content"])
+        if "message" in value:
+            return extract_text(value["message"])
+    return ""
+
+
+def parse_roots(root_args: list[str] | None) -> dict[str, Path]:
+    roots = default_roots()
+    for raw in root_args or []:
+        if "=" not in raw:
+            raise SystemExit(f"Invalid --root value: {raw!r}. Expected agent=/path")
+        agent, path_str = raw.split("=", 1)
+        agent = agent.strip()
+        if agent not in roots:
+            raise SystemExit(f"Unknown agent {agent!r}. Expected one of: {', '.join(sorted(roots))}")
+        roots[agent] = Path(path_str).expanduser()
+    return roots
+
+
+def discover_files(agent: str, root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    files: list[Path] = []
+    if agent == "claude":
+        projects = root / "projects"
+        if projects.exists():
+            for path in projects.rglob("*.jsonl"):
+                if "/subagents/" in path.as_posix():
+                    continue
+                if path.name.startswith("agent-"):
+                    continue
+                files.append(path)
+        transcripts = root / "transcripts"
+        if transcripts.exists():
+            files.extend(sorted(transcripts.glob("*.jsonl")))
+    elif agent == "claude-gp":
+        projects = root / "projects"
+        if projects.exists():
+            for path in projects.rglob("*.jsonl"):
+                if "/subagents/" in path.as_posix():
+                    continue
+                if path.name.startswith("agent-"):
+                    continue
+                files.append(path)
+    elif agent == "codex":
+        for rel in ("sessions", "archived_sessions"):
+            base = root / rel
+            if base.exists():
+                files.extend(sorted(base.rglob("*.jsonl")))
+    elif agent == "factory":
+        base = root / "sessions"
+        if base.exists():
+            files.extend(sorted(base.rglob("*.jsonl")))
+    return sorted({path.resolve() for path in files if path.suffix == ".jsonl"})
+
+
+def within_days(path: Path, days: int | None) -> bool:
+    if days is None:
+        return True
+    cutoff = dt.datetime.now(dt.timezone.utc).timestamp() - (days * 86400)
+    return path.stat().st_mtime >= cutoff
+
+
+def compute_attention(messages: list[Message]) -> tuple[float, list[str]]:
+    flags: list[str] = []
+    assistant_messages = [message for message in messages if message.role == "assistant" and message.text]
+    if not assistant_messages:
+        score = 0.45 if any(message.role == "user" for message in messages) else 0.0
+        if score:
+            flags.append("no_reply")
+        return score, flags
+
+    latest = normalize_space(assistant_messages[-1].text).lower()
+    score = 0.1
+    for flag, pattern in ATTENTION_PATTERNS:
+        if pattern.search(latest):
+            flags.append(flag)
+            score += 0.18
+    for pattern in DONE_PATTERNS:
+        if pattern.search(latest):
+            score -= 0.2
+            flags.append("looks_done")
+            break
+    score = max(0.0, min(1.0, score))
+    return score, sorted(set(flags))
+
+
+def build_session_record(agent: str, source_path: Path, session_id: str, cwd: str, started_at: str, messages: list[Message]) -> SessionRecord:
+    meaningful = [message for message in messages if message.text and not is_noise_text(message.text)]
+    user_messages = [message for message in meaningful if message.role == "user"]
+    assistant_messages = [message for message in meaningful if message.role == "assistant"]
+
+    first_user = user_messages[0].text if user_messages else ""
+    last_user = user_messages[-1].text if user_messages else ""
+    last_agent_messages = [message.text for message in assistant_messages[-5:]]
+    updated_at = meaningful[-1].ts if meaningful else started_at
+    title = compact_text(first_user or source_path.stem, 120)
+    attention_score, flags = compute_attention(meaningful)
+    session_key = f"{agent}:{source_path}"
+
+    return SessionRecord(
+        session_key=session_key,
+        session_id=session_id or source_path.stem,
+        agent=agent,
+        source_path=str(source_path),
+        cwd=cwd,
+        started_at=started_at,
+        updated_at=updated_at,
+        title=title,
+        first_user_message=compact_text(first_user, 500),
+        last_user_message=compact_text(last_user, 500),
+        last_agent_messages=[compact_text(message, 500) for message in last_agent_messages],
+        message_count=len(meaningful),
+        attention_score=attention_score,
+        flags=flags,
+        messages=[Message(role=message.role, text=compact_text(message.text, 1500), ts=message.ts) for message in meaningful],
+    )
+
+
+def parse_claude_file(agent: str, source_path: Path) -> SessionRecord | None:
+    messages: list[Message] = []
+    session_id = ""
+    cwd = ""
+    started_at = ""
+
+    for obj in iter_jsonl(source_path):
+        session_id = session_id or str(obj.get("sessionId", ""))
+        cwd = cwd or str(obj.get("cwd", ""))
+        timestamp = str(obj.get("timestamp", ""))
+        if timestamp and not started_at:
+            started_at = timestamp
+        record_type = obj.get("type")
+
+        if record_type == "user":
+            if obj.get("isMeta"):
+                continue
+            payload = obj.get("message", obj)
+            text = extract_text(payload.get("content"))
+            if is_noise_text(text):
+                continue
+            messages.append(Message("user", normalize_space(text), timestamp))
+        elif record_type == "assistant":
+            payload = obj.get("message", obj)
+            text = extract_text(payload.get("content"))
+            if not text and obj.get("error"):
+                text = str(obj["error"])
+            if is_noise_text(text):
+                continue
+            messages.append(Message("assistant", normalize_space(text), timestamp))
+
+    if not started_at:
+        started_at = dt.datetime.fromtimestamp(source_path.stat().st_mtime, tz=dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    if not messages and not source_path.name.startswith("ses_"):
+        return None
+    if not messages and source_path.name.startswith("ses_"):
+        for obj in iter_jsonl(source_path):
+            text = extract_text(obj.get("content"))
+            timestamp = str(obj.get("timestamp", started_at))
+            if text:
+                messages.append(Message("user", normalize_space(text), timestamp))
+    return build_session_record(agent, source_path, session_id or source_path.stem, cwd, started_at, messages)
+
+
+def parse_codex_file(source_path: Path) -> SessionRecord | None:
+    messages: list[Message] = []
+    session_id = ""
+    cwd = ""
+    started_at = ""
+
+    for obj in iter_jsonl(source_path):
+        record_type = obj.get("type")
+        timestamp = str(obj.get("timestamp", ""))
+        if record_type == "session_meta":
+            payload = obj.get("payload", {})
+            session_id = session_id or str(payload.get("id", ""))
+            cwd = cwd or str(payload.get("cwd", ""))
+            started_at = started_at or str(payload.get("timestamp", "")) or timestamp
+            continue
+        if record_type != "response_item":
+            continue
+        payload = obj.get("payload", {})
+        if payload.get("type") != "message":
+            continue
+        role = payload.get("role")
+        text = extract_text(payload.get("content"))
+        if role not in {"user", "assistant"} or is_noise_text(text):
+            continue
+        messages.append(Message(str(role), normalize_space(text), timestamp))
+
+    if not started_at:
+        started_at = dt.datetime.fromtimestamp(source_path.stat().st_mtime, tz=dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    if not messages:
+        return None
+    return build_session_record("codex", source_path, session_id or source_path.stem, cwd, started_at, messages)
+
+
+def parse_factory_file(source_path: Path) -> SessionRecord | None:
+    messages: list[Message] = []
+    session_id = ""
+    cwd = ""
+    started_at = ""
+
+    for obj in iter_jsonl(source_path):
+        record_type = obj.get("type")
+        if record_type == "session_start":
+            session_id = session_id or str(obj.get("id", ""))
+            cwd = cwd or str(obj.get("cwd", ""))
+            continue
+        if record_type != "message":
+            continue
+        payload = obj.get("message", {})
+        role = payload.get("role")
+        timestamp = str(obj.get("timestamp", ""))
+        started_at = started_at or timestamp
+        text = extract_text(payload.get("content"))
+        if role not in {"user", "assistant"} or is_noise_text(text):
+            continue
+        messages.append(Message(str(role), normalize_space(text), timestamp))
+
+    if not started_at:
+        started_at = dt.datetime.fromtimestamp(source_path.stat().st_mtime, tz=dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    if not messages:
+        return None
+    return build_session_record("factory", source_path, session_id or source_path.stem, cwd, started_at, messages)
+
+
+def parse_session_file(agent: str, source_path: Path) -> SessionRecord | None:
+    if agent in {"claude", "claude-gp"}:
+        return parse_claude_file(agent, source_path)
+    if agent == "codex":
+        return parse_codex_file(source_path)
+    if agent == "factory":
+        return parse_factory_file(source_path)
+    raise ValueError(f"Unsupported agent: {agent}")
+
+
+def connect_db(db_path: Path) -> sqlite3.Connection:
+    ensure_parent(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS source_files (
+            path TEXT PRIMARY KEY,
+            agent TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            indexed_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_key TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            agent TEXT NOT NULL,
+            source_path TEXT NOT NULL UNIQUE,
+            cwd TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            title TEXT NOT NULL,
+            first_user_message TEXT NOT NULL,
+            last_user_message TEXT NOT NULL,
+            last_agent_messages_json TEXT NOT NULL,
+            message_count INTEGER NOT NULL,
+            attention_score REAL NOT NULL,
+            flags_json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS messages (
+            session_key TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            text TEXT NOT NULL,
+            PRIMARY KEY (session_key, ordinal),
+            FOREIGN KEY (session_key) REFERENCES sessions(session_key) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent);
+        CREATE INDEX IF NOT EXISTS idx_messages_session_key ON messages(session_key, ordinal DESC);
+        """
+    )
+    return conn
+
+
+def upsert_session(conn: sqlite3.Connection, record: SessionRecord, size: int, mtime_ns: int) -> None:
+    conn.execute(
+        """
+        INSERT INTO source_files(path, agent, size, mtime_ns, indexed_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET
+            agent=excluded.agent,
+            size=excluded.size,
+            mtime_ns=excluded.mtime_ns,
+            indexed_at=excluded.indexed_at
+        """,
+        (record.source_path, record.agent, size, mtime_ns, utc_now()),
+    )
+    conn.execute("DELETE FROM messages WHERE session_key = ?", (record.session_key,))
+    conn.execute(
+        """
+        INSERT INTO sessions(
+            session_key, session_id, agent, source_path, cwd, started_at, updated_at,
+            title, first_user_message, last_user_message, last_agent_messages_json,
+            message_count, attention_score, flags_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_key) DO UPDATE SET
+            session_id=excluded.session_id,
+            agent=excluded.agent,
+            source_path=excluded.source_path,
+            cwd=excluded.cwd,
+            started_at=excluded.started_at,
+            updated_at=excluded.updated_at,
+            title=excluded.title,
+            first_user_message=excluded.first_user_message,
+            last_user_message=excluded.last_user_message,
+            last_agent_messages_json=excluded.last_agent_messages_json,
+            message_count=excluded.message_count,
+            attention_score=excluded.attention_score,
+            flags_json=excluded.flags_json
+        """,
+        (
+            record.session_key,
+            record.session_id,
+            record.agent,
+            record.source_path,
+            record.cwd,
+            record.started_at,
+            record.updated_at,
+            record.title,
+            record.first_user_message,
+            record.last_user_message,
+            json.dumps(record.last_agent_messages),
+            record.message_count,
+            record.attention_score,
+            json.dumps(record.flags),
+        ),
+    )
+    conn.executemany(
+        "INSERT INTO messages(session_key, ordinal, role, ts, text) VALUES (?, ?, ?, ?, ?)",
+        [
+            (record.session_key, index, message.role, message.ts, message.text)
+            for index, message in enumerate(record.messages)
+        ],
+    )
+
+
+def remove_missing_sources(conn: sqlite3.Connection, discovered_paths: set[str]) -> int:
+    rows = conn.execute("SELECT path FROM source_files").fetchall()
+    removed = 0
+    for row in rows:
+        path = row["path"]
+        if path in discovered_paths:
+            continue
+        session = conn.execute("SELECT session_key FROM sessions WHERE source_path = ?", (path,)).fetchone()
+        if session:
+            conn.execute("DELETE FROM messages WHERE session_key = ?", (session["session_key"],))
+            conn.execute("DELETE FROM sessions WHERE session_key = ?", (session["session_key"],))
+        conn.execute("DELETE FROM source_files WHERE path = ?", (path,))
+        removed += 1
+    return removed
+
+
+def ingest(db_path: Path, roots: dict[str, Path], days: int | None, verbose: bool = False) -> dict[str, int]:
+    conn = connect_db(db_path)
+    discovered: list[tuple[str, Path]] = []
+    for agent, root in roots.items():
+        for path in discover_files(agent, root):
+            if not within_days(path, days):
+                continue
+            discovered.append((agent, path))
+
+    discovered_paths = {str(path) for _, path in discovered}
+    existing = {
+        row["path"]: (row["size"], row["mtime_ns"])
+        for row in conn.execute("SELECT path, size, mtime_ns FROM source_files")
+    }
+
+    new_count = 0
+    updated_count = 0
+    skipped_count = 0
+    parsed_count = 0
+
+    for agent, path in discovered:
+        stat = path.stat()
+        cached = existing.get(str(path))
+        if cached == (stat.st_size, stat.st_mtime_ns):
+            skipped_count += 1
+            continue
+        record = parse_session_file(agent, path)
+        if record is None:
+            conn.execute("DELETE FROM source_files WHERE path = ?", (str(path),))
+            conn.execute("DELETE FROM sessions WHERE source_path = ?", (str(path),))
+            continue
+        upsert_session(conn, record, stat.st_size, stat.st_mtime_ns)
+        parsed_count += 1
+        if cached is None:
+            new_count += 1
+        else:
+            updated_count += 1
+        if verbose:
+            print(f"indexed {agent:9s} {path}")
+
+    removed_count = remove_missing_sources(conn, discovered_paths)
+    conn.commit()
+    conn.close()
+    return {
+        "discovered": len(discovered),
+        "days": days,
+        "parsed": parsed_count,
+        "new": new_count,
+        "updated": updated_count,
+        "skipped": skipped_count,
+        "removed": removed_count,
+    }
+
+
+def iso_threshold(days: int) -> str:
+    threshold = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    return threshold.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def query_sessions(conn: sqlite3.Connection, days: int, agent: str, needs_attention: bool, query: str, limit: int, sort: str) -> list[dict[str, Any]]:
+    clauses = ["updated_at >= ?"]
+    params: list[Any] = [iso_threshold(days)]
+    if agent:
+        clauses.append("agent = ?")
+        params.append(agent)
+    if needs_attention:
+        clauses.append("attention_score >= 0.35")
+    if query:
+        clauses.append("(lower(title) LIKE ? OR lower(cwd) LIKE ? OR lower(first_user_message) LIKE ? OR lower(last_user_message) LIKE ?)")
+        needle = f"%{query.lower()}%"
+        params.extend([needle, needle, needle, needle])
+
+    order = "attention_score DESC, updated_at DESC" if sort == "attention" else "updated_at DESC, attention_score DESC"
+    sql = f"""
+        SELECT *
+        FROM sessions
+        WHERE {' AND '.join(clauses)}
+        ORDER BY {order}
+        LIMIT ?
+    """
+    params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        results.append(
+            {
+                "session_key": row["session_key"],
+                "session_id": row["session_id"],
+                "agent": row["agent"],
+                "source_path": row["source_path"],
+                "cwd": row["cwd"],
+                "started_at": row["started_at"],
+                "updated_at": row["updated_at"],
+                "title": row["title"],
+                "first_user_message": row["first_user_message"],
+                "last_user_message": row["last_user_message"],
+                "last_agent_messages": json.loads(row["last_agent_messages_json"]),
+                "message_count": row["message_count"],
+                "attention_score": row["attention_score"],
+                "flags": json.loads(row["flags_json"]),
+            }
+        )
+    return results
+
+
+def query_session_detail(conn: sqlite3.Connection, session_key: str) -> dict[str, Any] | None:
+    row = conn.execute("SELECT * FROM sessions WHERE session_key = ?", (session_key,)).fetchone()
+    if row is None:
+        return None
+    messages = conn.execute(
+        """
+        SELECT role, ts, text
+        FROM messages
+        WHERE session_key = ?
+        ORDER BY ordinal DESC
+        LIMIT 30
+        """,
+        (session_key,),
+    ).fetchall()
+    return {
+        "session_key": row["session_key"],
+        "session_id": row["session_id"],
+        "agent": row["agent"],
+        "cwd": row["cwd"],
+        "source_path": row["source_path"],
+        "started_at": row["started_at"],
+        "updated_at": row["updated_at"],
+        "title": row["title"],
+        "attention_score": row["attention_score"],
+        "flags": json.loads(row["flags_json"]),
+        "messages": [
+            {"role": message["role"], "ts": message["ts"], "text": message["text"]}
+            for message in reversed(messages)
+        ],
+    }
+
+
+HTML_PAGE = textwrap.dedent(
+    """\
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Agent Chat Audit</title>
+      <style>
+        :root {
+          --bg: #f3efe4;
+          --panel: rgba(255, 251, 243, 0.9);
+          --panel-strong: #fffaf1;
+          --text: #1d1c18;
+          --muted: #6f675a;
+          --line: rgba(66, 48, 20, 0.14);
+          --accent: #af4b2f;
+          --accent-soft: rgba(175, 75, 47, 0.12);
+          --good: #2d7c54;
+          --warn: #a86611;
+          --bad: #a12424;
+          --shadow: 0 24px 70px rgba(49, 28, 8, 0.12);
+          --font: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif;
+          --mono: "SFMono-Regular", "Cascadia Code", "Menlo", monospace;
+        }
+        * { box-sizing: border-box; }
+        body {
+          margin: 0;
+          font-family: var(--font);
+          color: var(--text);
+          background:
+            radial-gradient(circle at top left, rgba(175, 75, 47, 0.18), transparent 30%),
+            radial-gradient(circle at top right, rgba(45, 124, 84, 0.12), transparent 22%),
+            linear-gradient(180deg, #f8f2e6 0%, var(--bg) 50%, #efe6d4 100%);
+          min-height: 100vh;
+        }
+        .page {
+          width: min(1400px, calc(100vw - 32px));
+          margin: 0 auto;
+          padding: 24px 0 40px;
+        }
+        .hero {
+          display: grid;
+          grid-template-columns: 1.3fr 0.7fr;
+          gap: 18px;
+          margin-bottom: 18px;
+        }
+        .hero-card, .stats {
+          background: var(--panel);
+          border: 1px solid var(--line);
+          border-radius: 26px;
+          box-shadow: var(--shadow);
+          backdrop-filter: blur(12px);
+        }
+        .hero-card {
+          padding: 24px;
+        }
+        .eyebrow {
+          text-transform: uppercase;
+          letter-spacing: 0.14em;
+          font-size: 12px;
+          color: var(--accent);
+          margin-bottom: 8px;
+        }
+        h1 {
+          margin: 0 0 12px;
+          font-size: clamp(34px, 6vw, 56px);
+          line-height: 0.96;
+        }
+        .hero p {
+          margin: 0;
+          color: var(--muted);
+          font-size: 17px;
+          max-width: 54ch;
+        }
+        .stats {
+          padding: 18px 20px;
+          display: grid;
+          gap: 12px;
+          align-content: start;
+        }
+        .stat-line {
+          display: flex;
+          justify-content: space-between;
+          gap: 12px;
+          padding-bottom: 10px;
+          border-bottom: 1px solid var(--line);
+        }
+        .stat-line:last-child {
+          border-bottom: 0;
+          padding-bottom: 0;
+        }
+        .controls {
+          display: grid;
+          grid-template-columns: repeat(6, minmax(0, 1fr));
+          gap: 12px;
+          background: var(--panel);
+          border: 1px solid var(--line);
+          border-radius: 22px;
+          padding: 14px;
+          box-shadow: var(--shadow);
+          margin-bottom: 18px;
+        }
+        .controls label {
+          display: grid;
+          gap: 6px;
+          font-size: 13px;
+          color: var(--muted);
+        }
+        .controls input, .controls select {
+          width: 100%;
+          border: 1px solid var(--line);
+          border-radius: 14px;
+          background: var(--panel-strong);
+          padding: 11px 12px;
+          font: inherit;
+          color: var(--text);
+        }
+        .controls .toggle {
+          display: flex;
+          align-items: end;
+          gap: 10px;
+          padding: 0 8px 8px;
+        }
+        .toggle input { width: auto; }
+        .results-meta {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 12px;
+          color: var(--muted);
+          margin: 10px 2px 16px;
+        }
+        .session-list {
+          display: grid;
+          gap: 14px;
+        }
+        .session {
+          position: relative;
+          overflow: hidden;
+          background: var(--panel);
+          border: 1px solid var(--line);
+          border-radius: 24px;
+          box-shadow: var(--shadow);
+        }
+        .session::before {
+          content: "";
+          position: absolute;
+          inset: 0 auto 0 0;
+          width: 7px;
+          background: linear-gradient(180deg, rgba(175, 75, 47, 0.95), rgba(45, 124, 84, 0.65));
+          opacity: var(--attention, 0.2);
+        }
+        .session-main {
+          display: grid;
+          grid-template-columns: 1.3fr 0.7fr;
+          gap: 18px;
+          padding: 18px 18px 14px 22px;
+        }
+        .headline {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: 8px;
+          margin-bottom: 10px;
+        }
+        .badge, .flag {
+          display: inline-flex;
+          align-items: center;
+          border-radius: 999px;
+          padding: 4px 10px;
+          font-size: 12px;
+          line-height: 1;
+          border: 1px solid var(--line);
+          background: rgba(255, 255, 255, 0.55);
+        }
+        .badge {
+          color: var(--accent);
+          background: var(--accent-soft);
+        }
+        .flag { color: var(--muted); }
+        .title {
+          margin: 0 0 8px;
+          font-size: 25px;
+          line-height: 1.06;
+        }
+        .path, .times {
+          color: var(--muted);
+          font-size: 13px;
+          margin-bottom: 8px;
+        }
+        .section-label {
+          text-transform: uppercase;
+          letter-spacing: 0.12em;
+          font-size: 11px;
+          color: var(--muted);
+          margin-bottom: 5px;
+        }
+        .blurb {
+          font-size: 15px;
+          line-height: 1.4;
+          margin-bottom: 10px;
+        }
+        .agent-tail {
+          display: grid;
+          gap: 8px;
+        }
+        .tail-item {
+          padding: 10px 12px;
+          border-radius: 16px;
+          border: 1px solid var(--line);
+          background: rgba(255, 255, 255, 0.52);
+          font-size: 14px;
+          line-height: 1.35;
+        }
+        .session-actions {
+          display: flex;
+          gap: 10px;
+          padding: 0 18px 18px 22px;
+        }
+        button, .link-button {
+          border: 1px solid var(--line);
+          border-radius: 999px;
+          background: var(--panel-strong);
+          color: var(--text);
+          font: inherit;
+          padding: 10px 14px;
+          cursor: pointer;
+          text-decoration: none;
+        }
+        button:hover, .link-button:hover { border-color: rgba(175, 75, 47, 0.45); }
+        .detail {
+          display: none;
+          border-top: 1px solid var(--line);
+          padding: 18px 22px 20px;
+          background: rgba(255, 250, 241, 0.82);
+        }
+        .detail.open { display: block; }
+        .message-log {
+          display: grid;
+          gap: 10px;
+          margin-top: 12px;
+        }
+        .message {
+          border-radius: 16px;
+          border: 1px solid var(--line);
+          background: rgba(255, 255, 255, 0.64);
+          padding: 12px 14px;
+        }
+        .message.assistant { border-left: 4px solid var(--good); }
+        .message.user { border-left: 4px solid var(--accent); }
+        .message-meta {
+          display: flex;
+          justify-content: space-between;
+          gap: 12px;
+          margin-bottom: 6px;
+          color: var(--muted);
+          font-size: 12px;
+          font-family: var(--mono);
+        }
+        .empty {
+          padding: 36px;
+          text-align: center;
+          color: var(--muted);
+          background: var(--panel);
+          border: 1px solid var(--line);
+          border-radius: 24px;
+        }
+        @media (max-width: 980px) {
+          .hero, .session-main { grid-template-columns: 1fr; }
+          .controls { grid-template-columns: 1fr 1fr; }
+        }
+        @media (max-width: 640px) {
+          .page { width: min(100vw - 18px, 100%); }
+          .controls { grid-template-columns: 1fr; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="page">
+        <section class="hero">
+          <div class="hero-card">
+            <div class="eyebrow">Local Transcript Index</div>
+            <h1>Recover the chats you left hanging.</h1>
+            <p>Browse your Claude, Claude-GP, Codex, and Factory sessions without reprocessing the full transcript history. Each card shows the first ask you made and the latest replies you got back.</p>
+          </div>
+          <div class="stats">
+            <div class="stat-line"><span>Indexed sessions</span><strong id="stat-sessions">-</strong></div>
+            <div class="stat-line"><span>Needs attention</span><strong id="stat-attention">-</strong></div>
+            <div class="stat-line"><span>Visible range</span><strong id="stat-days">-</strong></div>
+          </div>
+        </section>
+
+        <section class="controls">
+          <label>Days
+            <input id="days" type="number" min="1" step="1" value="7">
+          </label>
+          <label>Agent
+            <select id="agent">
+              <option value="">All agents</option>
+              <option value="claude">Claude</option>
+              <option value="claude-gp">Claude-GP</option>
+              <option value="codex">Codex</option>
+              <option value="factory">Factory</option>
+            </select>
+          </label>
+          <label>Search
+            <input id="query" type="search" placeholder="project, prompt, follow-up">
+          </label>
+          <label>Sort
+            <select id="sort">
+              <option value="attention">Needs attention</option>
+              <option value="updated">Most recent</option>
+            </select>
+          </label>
+          <label>Limit
+            <select id="limit">
+              <option value="100">100</option>
+              <option value="200">200</option>
+              <option value="500">500</option>
+            </select>
+          </label>
+          <div class="toggle">
+            <input id="needs-attention" type="checkbox">
+            <label for="needs-attention">Only likely follow-up</label>
+          </div>
+        </section>
+
+        <div class="results-meta">
+          <div id="status">Loading...</div>
+          <div>Click a card to load the last 30 meaningful messages.</div>
+        </div>
+
+        <section id="results" class="session-list"></section>
+      </div>
+
+      <script>
+        const state = {
+          loading: false,
+          detailCache: new Map(),
+        };
+
+        const elements = {
+          days: document.getElementById("days"),
+          agent: document.getElementById("agent"),
+          query: document.getElementById("query"),
+          sort: document.getElementById("sort"),
+          limit: document.getElementById("limit"),
+          needsAttention: document.getElementById("needs-attention"),
+          results: document.getElementById("results"),
+          status: document.getElementById("status"),
+          statSessions: document.getElementById("stat-sessions"),
+          statAttention: document.getElementById("stat-attention"),
+          statDays: document.getElementById("stat-days"),
+        };
+
+        function escapeHtml(value) {
+          return value
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;");
+        }
+
+        function relativeTime(value) {
+          if (!value) return "unknown";
+          const then = new Date(value);
+          const diffMs = Date.now() - then.getTime();
+          const diffMinutes = Math.round(diffMs / 60000);
+          if (Math.abs(diffMinutes) < 60) return `${diffMinutes}m ago`;
+          const diffHours = Math.round(diffMinutes / 60);
+          if (Math.abs(diffHours) < 48) return `${diffHours}h ago`;
+          const diffDays = Math.round(diffHours / 24);
+          return `${diffDays}d ago`;
+        }
+
+        function attentionOpacity(score) {
+          return Math.max(0.16, Math.min(1, score + 0.14));
+        }
+
+        function buildSessionCard(session) {
+          const tail = session.last_agent_messages.length
+            ? session.last_agent_messages.map(item => `<div class="tail-item">${escapeHtml(item)}</div>`).join("")
+            : `<div class="tail-item">No assistant reply was captured.</div>`;
+
+          const flags = session.flags.map(flag => `<span class="flag">${escapeHtml(flag)}</span>`).join("");
+          const detailId = `detail-${CSS.escape(session.session_key)}`;
+          const scorePercent = Math.round(session.attention_score * 100);
+
+          return `
+            <article class="session" data-session-key="${escapeHtml(session.session_key)}" style="--attention:${attentionOpacity(session.attention_score)}">
+              <div class="session-main">
+                <div>
+                  <div class="headline">
+                    <span class="badge">${escapeHtml(session.agent)}</span>
+                    <span class="flag">${scorePercent}% follow-up</span>
+                    ${flags}
+                  </div>
+                  <h2 class="title">${escapeHtml(session.title)}</h2>
+                  <div class="path">${escapeHtml(session.cwd || session.source_path)}</div>
+                  <div class="times">Updated ${relativeTime(session.updated_at)} · ${escapeHtml(session.updated_at || "unknown")} · ${session.message_count} meaningful messages</div>
+                  <div class="section-label">First user message</div>
+                  <div class="blurb">${escapeHtml(session.first_user_message || "(none captured)")}</div>
+                  ${session.last_user_message && session.last_user_message !== session.first_user_message ? `
+                    <div class="section-label">Last user message</div>
+                    <div class="blurb">${escapeHtml(session.last_user_message)}</div>
+                  ` : ""}
+                </div>
+                <div>
+                  <div class="section-label">Latest assistant replies</div>
+                  <div class="agent-tail">${tail}</div>
+                </div>
+              </div>
+              <div class="session-actions">
+                <button data-toggle="${escapeHtml(session.session_key)}">Show tail</button>
+                <a class="link-button" href="/api/raw?session_key=${encodeURIComponent(session.session_key)}" target="_blank" rel="noreferrer">Raw transcript</a>
+              </div>
+              <div class="detail" id="${detailId}"></div>
+            </article>
+          `;
+        }
+
+        async function fetchJson(url) {
+          const response = await fetch(url);
+          if (!response.ok) {
+            throw new Error(`Request failed: ${response.status}`);
+          }
+          return response.json();
+        }
+
+        async function loadSessions() {
+          state.loading = true;
+          elements.status.textContent = "Loading sessions...";
+          const params = new URLSearchParams({
+            days: elements.days.value || "7",
+            agent: elements.agent.value,
+            q: elements.query.value.trim(),
+            sort: elements.sort.value,
+            limit: elements.limit.value,
+          });
+          if (elements.needsAttention.checked) {
+            params.set("needs_attention", "1");
+          }
+
+          try {
+            const data = await fetchJson(`/api/sessions?${params.toString()}`);
+            elements.results.innerHTML = data.sessions.length
+              ? data.sessions.map(buildSessionCard).join("")
+              : `<div class="empty">No sessions matched the current filters.</div>`;
+
+            const attentionCount = data.sessions.filter(session => session.attention_score >= 0.35).length;
+            elements.status.textContent = `${data.sessions.length} sessions loaded`;
+            elements.statSessions.textContent = String(data.sessions.length);
+            elements.statAttention.textContent = String(attentionCount);
+            elements.statDays.textContent = `${params.get("days")} days`;
+          } catch (error) {
+            elements.results.innerHTML = `<div class="empty">${escapeHtml(String(error))}</div>`;
+            elements.status.textContent = "Load failed";
+          } finally {
+            state.loading = false;
+          }
+        }
+
+        async function toggleDetail(sessionKey) {
+          const detail = document.getElementById(`detail-${CSS.escape(sessionKey)}`);
+          if (!detail) return;
+          if (detail.classList.contains("open")) {
+            detail.classList.remove("open");
+            detail.innerHTML = "";
+            return;
+          }
+
+          detail.classList.add("open");
+          detail.innerHTML = "Loading tail...";
+          let payload = state.detailCache.get(sessionKey);
+          if (!payload) {
+            payload = await fetchJson(`/api/session?session_key=${encodeURIComponent(sessionKey)}`);
+            state.detailCache.set(sessionKey, payload);
+          }
+
+          const messages = payload.messages.length
+            ? payload.messages.map(message => `
+                <div class="message ${escapeHtml(message.role)}">
+                  <div class="message-meta">
+                    <span>${escapeHtml(message.role)}</span>
+                    <span>${escapeHtml(message.ts || "")}</span>
+                  </div>
+                  <div>${escapeHtml(message.text)}</div>
+                </div>
+              `).join("")
+            : "<div>No normalized messages stored for this session.</div>";
+
+          detail.innerHTML = `
+            <div class="section-label">Transcript tail</div>
+            <div class="path">${escapeHtml(payload.source_path)}</div>
+            <div class="message-log">${messages}</div>
+          `;
+        }
+
+        document.addEventListener("click", async event => {
+          const button = event.target.closest("button[data-toggle]");
+          if (!button) return;
+          await toggleDetail(button.getAttribute("data-toggle"));
+        });
+
+        let debounce;
+        for (const element of [elements.days, elements.agent, elements.sort, elements.limit, elements.needsAttention]) {
+          element.addEventListener("change", loadSessions);
+        }
+        elements.query.addEventListener("input", () => {
+          clearTimeout(debounce);
+          debounce = setTimeout(loadSessions, 200);
+        });
+
+        loadSessions();
+      </script>
+    </body>
+    </html>
+    """
+)
+
+
+def make_handler(db_path: Path, default_days: int):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/":
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(HTML_PAGE.encode("utf-8"))
+                return
+
+            if parsed.path == "/api/sessions":
+                query = urllib.parse.parse_qs(parsed.query)
+                days = int(query.get("days", [str(default_days)])[0])
+                agent = query.get("agent", [""])[0]
+                needs_attention = query.get("needs_attention", ["0"])[0] == "1"
+                needle = query.get("q", [""])[0]
+                limit = int(query.get("limit", ["200"])[0])
+                sort = query.get("sort", ["attention"])[0]
+                with connect_db(db_path) as conn:
+                    sessions = query_sessions(conn, days, agent, needs_attention, needle, limit, sort)
+                self.send_json({"sessions": sessions})
+                return
+
+            if parsed.path == "/api/session":
+                query = urllib.parse.parse_qs(parsed.query)
+                session_key = query.get("session_key", [""])[0]
+                with connect_db(db_path) as conn:
+                    payload = query_session_detail(conn, session_key)
+                if payload is None:
+                    self.send_error(HTTPStatus.NOT_FOUND, "Session not found")
+                    return
+                self.send_json(payload)
+                return
+
+            if parsed.path == "/api/raw":
+                query = urllib.parse.parse_qs(parsed.query)
+                session_key = query.get("session_key", [""])[0]
+                with connect_db(db_path) as conn:
+                    row = conn.execute("SELECT source_path FROM sessions WHERE session_key = ?", (session_key,)).fetchone()
+                if row is None:
+                    self.send_error(HTTPStatus.NOT_FOUND, "Session not found")
+                    return
+                source_path = Path(row["source_path"])
+                if not source_path.exists():
+                    self.send_error(HTTPStatus.NOT_FOUND, "Transcript file missing")
+                    return
+                content = source_path.read_text(encoding="utf-8", errors="replace")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(content.encode("utf-8"))
+                return
+
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+        def send_json(self, payload: dict[str, Any]) -> None:
+            encoded = json.dumps(payload).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+    return Handler
+
+
+def serve(db_path: Path, host: str, port: int, days: int, open_browser: bool) -> None:
+    server = ThreadingHTTPServer((host, port), make_handler(db_path, days))
+    url = f"http://{host}:{port}/"
+    print(f"Serving Agent Chat Audit at {url}")
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping server.")
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--db-path", default=str(DEFAULT_DB_PATH), help="SQLite index path")
+    parser.add_argument(
+        "--root",
+        action="append",
+        default=[],
+        help="Override an agent home directory, e.g. --root claude=/tmp/claude",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    ingest_parser = subparsers.add_parser("ingest", help="Index transcript files into SQLite")
+    ingest_parser.add_argument("--days", type=int, default=DEFAULT_DAYS, help="Only index files modified in the last N days")
+    ingest_parser.add_argument("--all", action="store_true", help="Index all discovered transcript files")
+    ingest_parser.add_argument("--verbose", action="store_true", help="Print every indexed file")
+
+    serve_parser = subparsers.add_parser("serve", help="Serve the browser UI")
+    serve_parser.add_argument("--host", default="127.0.0.1", help="Bind host")
+    serve_parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Bind port")
+    serve_parser.add_argument("--days", type=int, default=DEFAULT_DAYS, help="Default UI day range")
+    serve_parser.add_argument("--open", action="store_true", help="Open the browser automatically")
+
+    refresh_parser = subparsers.add_parser("refresh", help="Run ingest, then serve")
+    refresh_parser.add_argument("--days", type=int, default=DEFAULT_DAYS, help="Only index files modified in the last N days")
+    refresh_parser.add_argument("--all", action="store_true", help="Index all discovered transcript files")
+    refresh_parser.add_argument("--verbose", action="store_true", help="Print every indexed file")
+    refresh_parser.add_argument("--host", default="127.0.0.1", help="Bind host")
+    refresh_parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Bind port")
+    refresh_parser.add_argument("--ui-days", type=int, default=DEFAULT_DAYS, help="Default UI day range")
+    refresh_parser.add_argument("--open", action="store_true", help="Open the browser automatically")
+
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    db_path = Path(args.db_path).expanduser()
+    roots = parse_roots(args.root)
+
+    if args.command == "ingest":
+        summary = ingest(db_path, roots, days=None if args.all else args.days, verbose=args.verbose)
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "serve":
+        serve(db_path, args.host, args.port, args.days, args.open)
+        return 0
+
+    if args.command == "refresh":
+        summary = ingest(db_path, roots, days=None if args.all else args.days, verbose=args.verbose)
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        serve(db_path, args.host, args.port, args.ui_days, args.open)
+        return 0
+
+    raise AssertionError(f"Unhandled command: {args.command}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
