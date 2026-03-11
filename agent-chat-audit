@@ -9,6 +9,7 @@ import html
 import json
 import os
 import re
+import shlex
 import sqlite3
 import sys
 import textwrap
@@ -110,10 +111,19 @@ def compact_text(text: str, limit: int = 220) -> str:
     return text[: limit - 3].rstrip() + "..."
 
 
+def strip_known_prefixes(text: str) -> str:
+    text = text.lstrip()
+    if text.startswith("# AGENTS.md instructions for "):
+        match = re.match(r"^# AGENTS\.md instructions for .*?</INSTRUCTIONS>\s*", text, flags=re.DOTALL)
+        if match:
+            text = text[match.end() :]
+    return text.strip()
+
+
 def is_noise_text(text: str) -> bool:
     if not text:
         return True
-    stripped = text.strip()
+    stripped = strip_known_prefixes(text)
     if not stripped:
         return True
     if stripped in {"Tool loaded.", "TODO List Updated"}:
@@ -161,6 +171,10 @@ def extract_text(value: Any) -> str:
         if "message" in value:
             return extract_text(value["message"])
     return ""
+
+
+def clean_text(text: str) -> str:
+    return normalize_space(strip_known_prefixes(text))
 
 
 def parse_roots(root_args: list[str] | None) -> dict[str, Path]:
@@ -297,7 +311,7 @@ def parse_claude_file(agent: str, source_path: Path) -> SessionRecord | None:
             text = extract_text(payload.get("content"))
             if is_noise_text(text):
                 continue
-            messages.append(Message("user", normalize_space(text), timestamp))
+            messages.append(Message("user", clean_text(text), timestamp))
         elif record_type == "assistant":
             payload = obj.get("message", obj)
             text = extract_text(payload.get("content"))
@@ -305,7 +319,7 @@ def parse_claude_file(agent: str, source_path: Path) -> SessionRecord | None:
                 text = str(obj["error"])
             if is_noise_text(text):
                 continue
-            messages.append(Message("assistant", normalize_space(text), timestamp))
+            messages.append(Message("assistant", clean_text(text), timestamp))
 
     if not started_at:
         started_at = dt.datetime.fromtimestamp(source_path.stat().st_mtime, tz=dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -316,7 +330,7 @@ def parse_claude_file(agent: str, source_path: Path) -> SessionRecord | None:
             text = extract_text(obj.get("content"))
             timestamp = str(obj.get("timestamp", started_at))
             if text:
-                messages.append(Message("user", normalize_space(text), timestamp))
+                messages.append(Message("user", clean_text(text), timestamp))
     return build_session_record(agent, source_path, session_id or source_path.stem, cwd, started_at, messages)
 
 
@@ -344,7 +358,7 @@ def parse_codex_file(source_path: Path) -> SessionRecord | None:
         text = extract_text(payload.get("content"))
         if role not in {"user", "assistant"} or is_noise_text(text):
             continue
-        messages.append(Message(str(role), normalize_space(text), timestamp))
+        messages.append(Message(str(role), clean_text(text), timestamp))
 
     if not started_at:
         started_at = dt.datetime.fromtimestamp(source_path.stat().st_mtime, tz=dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -374,7 +388,7 @@ def parse_factory_file(source_path: Path) -> SessionRecord | None:
         text = extract_text(payload.get("content"))
         if role not in {"user", "assistant"} or is_noise_text(text):
             continue
-        messages.append(Message(str(role), normalize_space(text), timestamp))
+        messages.append(Message(str(role), clean_text(text), timestamp))
 
     if not started_at:
         started_at = dt.datetime.fromtimestamp(source_path.stat().st_mtime, tz=dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -432,6 +446,12 @@ def connect_db(db_path: Path) -> sqlite3.Connection:
             ts TEXT NOT NULL,
             text TEXT NOT NULL,
             PRIMARY KEY (session_key, ordinal),
+            FOREIGN KEY (session_key) REFERENCES sessions(session_key) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS review_later (
+            session_key TEXT PRIMARY KEY,
+            marked_at TEXT NOT NULL,
             FOREIGN KEY (session_key) REFERENCES sessions(session_key) ON DELETE CASCADE
         );
 
@@ -580,7 +600,37 @@ def iso_threshold(days: int) -> str:
     return threshold.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def query_sessions(conn: sqlite3.Connection, days: int, agent: str, needs_attention: bool, query: str, limit: int, sort: str) -> list[dict[str, Any]]:
+def session_workdir(row: sqlite3.Row | dict[str, Any]) -> str:
+    cwd = str(row["cwd"] or "").strip()
+    if cwd:
+        return cwd
+    return str(Path(str(row["source_path"])).parent)
+
+
+def resume_command(agent: str, session_id: str, cwd: str) -> str:
+    prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
+    session = shlex.quote(session_id)
+    if agent == "codex":
+        return f"{prefix}codex resume {session}"
+    if agent == "claude":
+        return f"{prefix}claude -r {session}"
+    if agent == "claude-gp":
+        return f"{prefix}CLAUDE_CONFIG_DIR=~/.claude-gp claude --dangerously-skip-permissions -r {session}"
+    if agent == "factory":
+        return f"{prefix}droid -r {session}"
+    return session
+
+
+def query_sessions(
+    conn: sqlite3.Connection,
+    days: int,
+    agent: str,
+    needs_attention: bool,
+    review_only: bool,
+    query: str,
+    limit: int,
+    sort: str,
+) -> list[dict[str, Any]]:
     clauses = ["updated_at >= ?"]
     params: list[Any] = [iso_threshold(days)]
     if agent:
@@ -588,6 +638,8 @@ def query_sessions(conn: sqlite3.Connection, days: int, agent: str, needs_attent
         params.append(agent)
     if needs_attention:
         clauses.append("attention_score >= 0.35")
+    if review_only:
+        clauses.append("review_later.session_key IS NOT NULL")
     if query:
         clauses.append("(lower(title) LIKE ? OR lower(cwd) LIKE ? OR lower(first_user_message) LIKE ? OR lower(last_user_message) LIKE ?)")
         needle = f"%{query.lower()}%"
@@ -595,8 +647,9 @@ def query_sessions(conn: sqlite3.Connection, days: int, agent: str, needs_attent
 
     order = "attention_score DESC, updated_at DESC" if sort == "attention" else "updated_at DESC, attention_score DESC"
     sql = f"""
-        SELECT *
+        SELECT sessions.*, review_later.marked_at AS review_later_marked_at
         FROM sessions
+        LEFT JOIN review_later ON review_later.session_key = sessions.session_key
         WHERE {' AND '.join(clauses)}
         ORDER BY {order}
         LIMIT ?
@@ -605,13 +658,14 @@ def query_sessions(conn: sqlite3.Connection, days: int, agent: str, needs_attent
     rows = conn.execute(sql, params).fetchall()
     results: list[dict[str, Any]] = []
     for row in rows:
+        cwd = session_workdir(row)
         results.append(
             {
                 "session_key": row["session_key"],
                 "session_id": row["session_id"],
                 "agent": row["agent"],
                 "source_path": row["source_path"],
-                "cwd": row["cwd"],
+                "cwd": cwd,
                 "started_at": row["started_at"],
                 "updated_at": row["updated_at"],
                 "title": row["title"],
@@ -621,15 +675,26 @@ def query_sessions(conn: sqlite3.Connection, days: int, agent: str, needs_attent
                 "message_count": row["message_count"],
                 "attention_score": row["attention_score"],
                 "flags": json.loads(row["flags_json"]),
+                "review_later": bool(row["review_later_marked_at"]),
+                "resume_command": resume_command(row["agent"], row["session_id"], cwd),
             }
         )
     return results
 
 
 def query_session_detail(conn: sqlite3.Connection, session_key: str) -> dict[str, Any] | None:
-    row = conn.execute("SELECT * FROM sessions WHERE session_key = ?", (session_key,)).fetchone()
+    row = conn.execute(
+        """
+        SELECT sessions.*, review_later.marked_at AS review_later_marked_at
+        FROM sessions
+        LEFT JOIN review_later ON review_later.session_key = sessions.session_key
+        WHERE sessions.session_key = ?
+        """,
+        (session_key,),
+    ).fetchone()
     if row is None:
         return None
+    cwd = session_workdir(row)
     messages = conn.execute(
         """
         SELECT role, ts, text
@@ -644,18 +709,39 @@ def query_session_detail(conn: sqlite3.Connection, session_key: str) -> dict[str
         "session_key": row["session_key"],
         "session_id": row["session_id"],
         "agent": row["agent"],
-        "cwd": row["cwd"],
+        "cwd": cwd,
         "source_path": row["source_path"],
         "started_at": row["started_at"],
         "updated_at": row["updated_at"],
         "title": row["title"],
         "attention_score": row["attention_score"],
         "flags": json.loads(row["flags_json"]),
+        "review_later": bool(row["review_later_marked_at"]),
+        "resume_command": resume_command(row["agent"], row["session_id"], cwd),
         "messages": [
             {"role": message["role"], "ts": message["ts"], "text": message["text"]}
             for message in reversed(messages)
         ],
     }
+
+
+def set_review_later(conn: sqlite3.Connection, session_key: str, review_later: bool) -> bool:
+    exists = conn.execute("SELECT 1 FROM sessions WHERE session_key = ?", (session_key,)).fetchone()
+    if exists is None:
+        return False
+    if review_later:
+        conn.execute(
+            """
+            INSERT INTO review_later(session_key, marked_at)
+            VALUES (?, ?)
+            ON CONFLICT(session_key) DO UPDATE SET marked_at=excluded.marked_at
+            """,
+            (session_key, utc_now()),
+        )
+    else:
+        conn.execute("DELETE FROM review_later WHERE session_key = ?", (session_key,))
+    conn.commit()
+    return True
 
 
 HTML_PAGE = textwrap.dedent(
@@ -752,7 +838,7 @@ HTML_PAGE = textwrap.dedent(
         }
         .controls {
           display: grid;
-          grid-template-columns: repeat(6, minmax(0, 1fr));
+          grid-template-columns: repeat(7, minmax(0, 1fr));
           gap: 12px;
           background: var(--panel);
           border: 1px solid var(--line);
@@ -839,10 +925,38 @@ HTML_PAGE = textwrap.dedent(
           background: var(--accent-soft);
         }
         .flag { color: var(--muted); }
+        .title-row {
+          display: flex;
+          align-items: flex-start;
+          gap: 10px;
+          justify-content: space-between;
+          margin-bottom: 8px;
+        }
         .title {
-          margin: 0 0 8px;
+          margin: 0;
           font-size: 25px;
           line-height: 1.06;
+        }
+        .title-actions {
+          display: flex;
+          gap: 8px;
+          flex-shrink: 0;
+        }
+        .icon-button {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 38px;
+          height: 38px;
+          padding: 0;
+          border-radius: 12px;
+        }
+        .icon-button svg {
+          width: 18px;
+          height: 18px;
+          stroke: currentColor;
+          fill: none;
+          stroke-width: 1.8;
         }
         .path, .times {
           color: var(--muted);
@@ -875,8 +989,14 @@ HTML_PAGE = textwrap.dedent(
         }
         .session-actions {
           display: flex;
+          flex-wrap: wrap;
           gap: 10px;
           padding: 0 18px 18px 22px;
+        }
+        .button-active {
+          border-color: rgba(175, 75, 47, 0.45);
+          background: var(--accent-soft);
+          color: var(--accent);
         }
         button, .link-button {
           border: 1px solid var(--line);
@@ -981,6 +1101,10 @@ HTML_PAGE = textwrap.dedent(
             </select>
           </label>
           <div class="toggle">
+            <input id="review-only" type="checkbox">
+            <label for="review-only">Review later only</label>
+          </div>
+          <div class="toggle">
             <input id="needs-attention" type="checkbox">
             <label for="needs-attention">Only likely follow-up</label>
           </div>
@@ -1006,6 +1130,7 @@ HTML_PAGE = textwrap.dedent(
           query: document.getElementById("query"),
           sort: document.getElementById("sort"),
           limit: document.getElementById("limit"),
+          reviewOnly: document.getElementById("review-only"),
           needsAttention: document.getElementById("needs-attention"),
           results: document.getElementById("results"),
           status: document.getElementById("status"),
@@ -1037,6 +1162,15 @@ HTML_PAGE = textwrap.dedent(
           return Math.max(0.16, Math.min(1, score + 0.14));
         }
 
+        function copySvg() {
+          return `
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="9" y="9" width="10" height="10" rx="2"></rect>
+              <path d="M7 15H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2v1"></path>
+            </svg>
+          `;
+        }
+
         function buildSessionCard(session) {
           const tail = session.last_agent_messages.length
             ? session.last_agent_messages.map(item => `<div class="tail-item">${escapeHtml(item)}</div>`).join("")
@@ -1045,6 +1179,7 @@ HTML_PAGE = textwrap.dedent(
           const flags = session.flags.map(flag => `<span class="flag">${escapeHtml(flag)}</span>`).join("");
           const detailId = `detail-${CSS.escape(session.session_key)}`;
           const scorePercent = Math.round(session.attention_score * 100);
+          const reviewBadge = session.review_later ? `<span class="flag">review later</span>` : "";
 
           return `
             <article class="session" data-session-key="${escapeHtml(session.session_key)}" style="--attention:${attentionOpacity(session.attention_score)}">
@@ -1053,9 +1188,17 @@ HTML_PAGE = textwrap.dedent(
                   <div class="headline">
                     <span class="badge">${escapeHtml(session.agent)}</span>
                     <span class="flag">${scorePercent}% follow-up</span>
+                    ${reviewBadge}
                     ${flags}
                   </div>
-                  <h2 class="title">${escapeHtml(session.title)}</h2>
+                  <div class="title-row">
+                    <h2 class="title">${escapeHtml(session.title)}</h2>
+                    <div class="title-actions">
+                      <button class="icon-button" data-copy="${escapeHtml(session.session_key)}" title="Copy resume command">
+                        ${copySvg()}
+                      </button>
+                    </div>
+                  </div>
                   <div class="path">${escapeHtml(session.cwd || session.source_path)}</div>
                   <div class="times">Updated ${relativeTime(session.updated_at)} · ${escapeHtml(session.updated_at || "unknown")} · ${session.message_count} meaningful messages</div>
                   <div class="section-label">First user message</div>
@@ -1071,6 +1214,9 @@ HTML_PAGE = textwrap.dedent(
                 </div>
               </div>
               <div class="session-actions">
+                <button class="${session.review_later ? "button-active" : ""}" data-review="${escapeHtml(session.session_key)}" data-review-value="${session.review_later ? "0" : "1"}">
+                  ${session.review_later ? "Unmark review later" : "Review later"}
+                </button>
                 <button data-toggle="${escapeHtml(session.session_key)}">Show tail</button>
                 <a class="link-button" href="/api/raw?session_key=${encodeURIComponent(session.session_key)}" target="_blank" rel="noreferrer">Raw transcript</a>
               </div>
@@ -1099,6 +1245,9 @@ HTML_PAGE = textwrap.dedent(
           });
           if (elements.needsAttention.checked) {
             params.set("needs_attention", "1");
+          }
+          if (elements.reviewOnly.checked) {
+            params.set("review_only", "1");
           }
 
           try {
@@ -1152,18 +1301,66 @@ HTML_PAGE = textwrap.dedent(
           detail.innerHTML = `
             <div class="section-label">Transcript tail</div>
             <div class="path">${escapeHtml(payload.source_path)}</div>
+            <div class="path">${escapeHtml(payload.resume_command)}</div>
             <div class="message-log">${messages}</div>
           `;
         }
 
+        async function copyResumeCommand(sessionKey, button) {
+          try {
+            const data = await fetchJson(`/api/session?session_key=${encodeURIComponent(sessionKey)}`);
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              await navigator.clipboard.writeText(data.resume_command);
+            } else {
+              window.prompt("Copy resume command:", data.resume_command);
+            }
+            const oldTitle = button.title;
+            button.title = "Copied";
+            button.classList.add("button-active");
+            setTimeout(() => {
+              button.title = oldTitle;
+              button.classList.remove("button-active");
+            }, 900);
+          } catch (error) {
+            console.error(error);
+          }
+        }
+
+        async function toggleReviewLater(sessionKey, reviewLater) {
+          const response = await fetch("/api/review-later", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_key: sessionKey, review_later: reviewLater }),
+          });
+          if (!response.ok) {
+            throw new Error(`Failed to update review-later: ${response.status}`);
+          }
+          state.detailCache.delete(sessionKey);
+          await loadSessions();
+        }
+
         document.addEventListener("click", async event => {
+          const copyButton = event.target.closest("button[data-copy]");
+          if (copyButton) {
+            await copyResumeCommand(copyButton.getAttribute("data-copy"), copyButton);
+            return;
+          }
+
+          const reviewButton = event.target.closest("button[data-review]");
+          if (reviewButton) {
+            const sessionKey = reviewButton.getAttribute("data-review");
+            const reviewLater = reviewButton.getAttribute("data-review-value") === "1";
+            await toggleReviewLater(sessionKey, reviewLater);
+            return;
+          }
+
           const button = event.target.closest("button[data-toggle]");
           if (!button) return;
           await toggleDetail(button.getAttribute("data-toggle"));
         });
 
         let debounce;
-        for (const element of [elements.days, elements.agent, elements.sort, elements.limit, elements.needsAttention]) {
+        for (const element of [elements.days, elements.agent, elements.sort, elements.limit, elements.reviewOnly, elements.needsAttention]) {
           element.addEventListener("change", loadSessions);
         }
         elements.query.addEventListener("input", () => {
@@ -1195,11 +1392,12 @@ def make_handler(db_path: Path, default_days: int):
                 days = int(query.get("days", [str(default_days)])[0])
                 agent = query.get("agent", [""])[0]
                 needs_attention = query.get("needs_attention", ["0"])[0] == "1"
+                review_only = query.get("review_only", ["0"])[0] == "1"
                 needle = query.get("q", [""])[0]
                 limit = int(query.get("limit", ["200"])[0])
                 sort = query.get("sort", ["attention"])[0]
                 with connect_db(db_path) as conn:
-                    sessions = query_sessions(conn, days, agent, needs_attention, needle, limit, sort)
+                    sessions = query_sessions(conn, days, agent, needs_attention, review_only, needle, limit, sort)
                 self.send_json({"sessions": sessions})
                 return
 
@@ -1234,6 +1432,28 @@ def make_handler(db_path: Path, default_days: int):
                 return
 
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+        def do_POST(self) -> None:
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path != "/api/review-later":
+                self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+                return
+
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except (ValueError, json.JSONDecodeError):
+                self.send_error(HTTPStatus.BAD_REQUEST, "Invalid JSON body")
+                return
+
+            session_key = str(payload.get("session_key", ""))
+            review_later = bool(payload.get("review_later"))
+            with connect_db(db_path) as conn:
+                updated = set_review_later(conn, session_key, review_later)
+                if not updated:
+                    self.send_error(HTTPStatus.NOT_FOUND, "Session not found")
+                    return
+            self.send_json({"session_key": session_key, "review_later": review_later})
 
         def log_message(self, format: str, *args: Any) -> None:
             return
