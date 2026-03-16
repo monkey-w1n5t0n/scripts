@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# src-audit - Audit all active projects in ~/src
+#
+# Checks each project for: git health, docs presence, beads setup, staleness.
+# Outputs JSON to stdout. Use --html to also generate an HTML report.
+#
+# Usage: src-audit [--html FILE] [--projects FILE]
+
+set -euo pipefail
+
+SRC_DIR="${HOME}/src"
+PROJECTS_FILE="${SRC_DIR}/active_projects.txt"
+HTML_FILE=""
+BD_TIMEOUT=5  # seconds timeout for bd commands
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --html) HTML_FILE="$2"; shift 2 ;;
+    --projects) PROJECTS_FILE="$2"; shift 2 ;;
+    --help|-h)
+      echo "Usage: src-audit [--html FILE] [--projects FILE]"
+      echo "  --html FILE      Generate HTML report at FILE"
+      echo "  --projects FILE  Project list (default: ~/src/active_projects.txt)"
+      exit 0
+      ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ ! -f "$PROJECTS_FILE" ]]; then
+  echo "Error: projects file not found: $PROJECTS_FILE" >&2
+  exit 1
+fi
+
+# --- Per-repo audit ---
+
+audit_repo() {
+  local name="$1"
+  # Strip any parenthetical notes like "(website)"
+  local dir_name="${name%% (*}"
+  local repo_path="${SRC_DIR}/${dir_name}"
+
+  if [[ ! -d "$repo_path/.git" ]]; then
+    # Not a git repo (might be a plain directory or doesn't exist)
+    local exists_val=$( [[ -d "$repo_path" ]] && echo true || echo false )
+    jq -n -c --arg name "$name" --argjson exists "$exists_val" \
+      '{name:$name, exists:$exists, is_git:false}'
+    return
+  fi
+
+  # Git checks
+  local dirty_count=0 unpushed=0 has_remote=true stash_count=0
+  local current_branch="" last_commit_date="" last_commit_age_days=0
+
+  current_branch=$(git -C "$repo_path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+
+  # Dirty count (modified + untracked)
+  dirty_count=$(git -C "$repo_path" status --porcelain 2>/dev/null | wc -l)
+
+  # Unpushed commits
+  if git -C "$repo_path" rev-parse --verify '@{u}' &>/dev/null; then
+    unpushed=$(git -C "$repo_path" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+  else
+    has_remote=false
+    # Check if any remote exists at all
+    if git -C "$repo_path" remote 2>/dev/null | grep -q .; then
+      has_remote=true
+      # Has remote but no tracking branch
+      unpushed=-1  # unknown
+    fi
+  fi
+
+  # Stash count
+  stash_count=$(git -C "$repo_path" stash list 2>/dev/null | wc -l)
+
+  # Last commit date
+  last_commit_date=$(git -C "$repo_path" log -1 --format='%aI' 2>/dev/null || echo "")
+  if [[ -n "$last_commit_date" ]]; then
+    local now_epoch last_epoch
+    now_epoch=$(date +%s)
+    last_epoch=$(date -d "$last_commit_date" +%s 2>/dev/null || echo "$now_epoch")
+    last_commit_age_days=$(( (now_epoch - last_epoch) / 86400 ))
+  fi
+
+  # Docs checks
+  local has_readme=false has_claude_md=false has_license=false
+  [[ -f "$repo_path/README.md" || -f "$repo_path/readme.md" || -f "$repo_path/Readme.md" ]] && has_readme=true
+  [[ -f "$repo_path/CLAUDE.md" ]] && has_claude_md=true
+  [[ -f "$repo_path/LICENSE" || -f "$repo_path/LICENSE.md" || -f "$repo_path/COPYING" ]] && has_license=true
+
+  # Beads checks
+  local has_beads=false beads_healthy_json="null" stale_issues=0
+  if [[ -d "$repo_path/.beads" ]]; then
+    has_beads=true
+    # Try bd doctor (with timeout)
+    local doctor_out
+    if doctor_out=$(timeout "${BD_TIMEOUT}s" bd doctor --json 2>/dev/null < /dev/null); then
+      # Check if doctor passed
+      if echo "$doctor_out" | grep -q '"status":"healthy"' 2>/dev/null; then
+        beads_healthy_json=true
+      else
+        beads_healthy_json=false
+      fi
+    else
+      beads_healthy_json='"error"'
+    fi
+
+    # Check for stale open issues (>30 days)
+    local issues_out
+    if issues_out=$(cd "$repo_path" && timeout "${BD_TIMEOUT}s" bd list --status=open --json 2>/dev/null < /dev/null); then
+      if [[ -n "$issues_out" && "$issues_out" != "[]" && "$issues_out" != "null" ]]; then
+        local now_epoch
+        now_epoch=$(date +%s)
+        local thirty_days_ago=$(( now_epoch - 2592000 ))
+        # Count issues not updated in 30 days
+        stale_issues=$(echo "$issues_out" | jq --arg cutoff "$(date -d "@${thirty_days_ago}" -Iseconds)" \
+          '[.[] | select(.updated_at < $cutoff)] | length' 2>/dev/null || echo 0)
+      fi
+    fi
+  fi
+
+  # Determine overall severity
+  local severity="ok"
+  if [[ "$dirty_count" -gt 0 && "$has_remote" == "false" ]]; then
+    severity="error"  # orphaned dirty work
+  elif [[ "$dirty_count" -gt 0 || "$unpushed" -gt 0 || "$has_remote" == "false" ]]; then
+    severity="warning"
+  elif [[ "$has_readme" == "false" || "$has_beads" == "false" ]]; then
+    severity="warning"
+  elif [[ "$has_claude_md" == "false" ]]; then
+    severity="info"
+  fi
+
+  # Output JSON (using jq for safe escaping)
+  jq -n -c \
+    --arg name "$name" \
+    --arg severity "$severity" \
+    --arg branch "$current_branch" \
+    --argjson dirty "$dirty_count" \
+    --argjson unpushed "$unpushed" \
+    --argjson has_remote "$has_remote" \
+    --argjson stash "$stash_count" \
+    --arg last_date "$last_commit_date" \
+    --argjson age_days "$last_commit_age_days" \
+    --argjson has_readme "$has_readme" \
+    --argjson has_claude "$has_claude_md" \
+    --argjson has_license "$has_license" \
+    --argjson has_beads "$has_beads" \
+    --argjson beads_healthy_json "$beads_healthy_json" \
+    --argjson stale "$stale_issues" \
+    '{name:$name, exists:true, is_git:true, severity:$severity,
+      git:{branch:$branch, dirty_count:$dirty, unpushed:$unpushed, has_remote:$has_remote, stash_count:$stash, last_commit_date:$last_date, last_commit_age_days:$age_days},
+      docs:{has_readme:$has_readme, has_claude_md:$has_claude, has_license:$has_license},
+      beads:{has_beads:$has_beads, healthy:$beads_healthy_json, stale_issues:$stale}}'
+}
+
+# --- Main: collect all results ---
+
+results=()
+while IFS= read -r line; do
+  [[ -z "$line" || "$line" =~ ^# ]] && continue
+  result=$(audit_repo "$line")
+  results+=("$result")
+done < "$PROJECTS_FILE"
+
+# Combine into JSON array
+json_output=$(printf '%s\n' "${results[@]}" | jq -s '.')
+
+# Output JSON to stdout
+echo "$json_output"
+
+# --- HTML report ---
+
+if [[ -n "$HTML_FILE" ]]; then
+  # Compute summary stats
+  total=$(echo "$json_output" | jq 'length')
+  errors=$(echo "$json_output" | jq '[.[] | select(.severity == "error")] | length')
+  warnings=$(echo "$json_output" | jq '[.[] | select(.severity == "warning")] | length')
+  ok_count=$(echo "$json_output" | jq '[.[] | select(.severity == "ok")] | length')
+  missing_beads=$(echo "$json_output" | jq '[.[] | select(.is_git == true and .beads.has_beads == false)] | length')
+  missing_readme=$(echo "$json_output" | jq '[.[] | select(.is_git == true and .docs.has_readme == false)] | length')
+  missing_claude=$(echo "$json_output" | jq '[.[] | select(.is_git == true and .docs.has_claude_md == false)] | length')
+  dirty_repos=$(echo "$json_output" | jq '[.[] | select(.is_git == true and .git.dirty_count > 0)] | length')
+  unpushed_repos=$(echo "$json_output" | jq '[.[] | select(.is_git == true and .git.unpushed > 0)] | length')
+
+  cat > "$HTML_FILE" <<'HTMLHEAD'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>~/src Audit Report</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; padding: 2rem; }
+  h1 { color: #f0f6fc; margin-bottom: 0.5rem; font-size: 1.8rem; }
+  .subtitle { color: #8b949e; margin-bottom: 2rem; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+  .stat { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; text-align: center; }
+  .stat .num { font-size: 2rem; font-weight: bold; }
+  .stat .label { color: #8b949e; font-size: 0.85rem; margin-top: 0.25rem; }
+  .stat.error .num { color: #f85149; }
+  .stat.warning .num { color: #d29922; }
+  .stat.ok .num { color: #3fb950; }
+  .stat.info .num { color: #58a6ff; }
+  .section { margin-bottom: 2rem; }
+  .section h2 { color: #f0f6fc; font-size: 1.2rem; margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 1px solid #30363d; }
+  table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
+  th { background: #21262d; color: #8b949e; text-align: left; padding: 0.6rem 0.8rem; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  td { padding: 0.5rem 0.8rem; border-top: 1px solid #21262d; font-size: 0.9rem; }
+  tr:hover td { background: #1c2128; }
+  .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 12px; font-size: 0.75rem; font-weight: 600; }
+  .badge.error { background: #f8514922; color: #f85149; }
+  .badge.warning { background: #d2992222; color: #d29922; }
+  .badge.ok { background: #3fb95022; color: #3fb950; }
+  .badge.info { background: #58a6ff22; color: #58a6ff; }
+  .check { display: inline-block; width: 1.2em; text-align: center; }
+  .check.yes { color: #3fb950; }
+  .check.no { color: #f85149; }
+  .mono { font-family: 'SF Mono', Consolas, monospace; font-size: 0.85rem; }
+  .dim { color: #484f58; }
+</style>
+</head>
+<body>
+<h1>~/src Audit Report</h1>
+HTMLHEAD
+
+  # Add generated timestamp and stats
+  cat >> "$HTML_FILE" <<HTMLSTATS
+<p class="subtitle">Generated $(date '+%Y-%m-%d %H:%M') &mdash; ${total} projects audited</p>
+
+<div class="stats">
+  <div class="stat error"><div class="num">${errors}</div><div class="label">Errors</div></div>
+  <div class="stat warning"><div class="num">${warnings}</div><div class="label">Warnings</div></div>
+  <div class="stat ok"><div class="num">${ok_count}</div><div class="label">OK</div></div>
+  <div class="stat info"><div class="num">${dirty_repos}</div><div class="label">Dirty</div></div>
+  <div class="stat info"><div class="num">${unpushed_repos}</div><div class="label">Unpushed</div></div>
+  <div class="stat warning"><div class="num">${missing_beads}</div><div class="label">No Beads</div></div>
+  <div class="stat info"><div class="num">${missing_readme}</div><div class="label">No README</div></div>
+  <div class="stat info"><div class="num">${missing_claude}</div><div class="label">No CLAUDE.md</div></div>
+</div>
+HTMLSTATS
+
+  # Generate table rows from JSON
+  cat >> "$HTML_FILE" <<'TABLETOP'
+<div class="section">
+<h2>All Projects</h2>
+<table>
+<tr>
+  <th>Project</th>
+  <th>Status</th>
+  <th>Branch</th>
+  <th>Dirty</th>
+  <th>Unpush</th>
+  <th>Stash</th>
+  <th>Remote</th>
+  <th>README</th>
+  <th>CLAUDE</th>
+  <th>Beads</th>
+  <th>Last Commit</th>
+</tr>
+TABLETOP
+
+  # Generate table rows
+  echo "$json_output" | jq -r '.[] | select(.is_git == true) |
+    "<tr>" +
+    "<td class=\"mono\">" + .name + "</td>" +
+    "<td><span class=\"badge " + .severity + "\">" + .severity + "</span></td>" +
+    "<td class=\"mono dim\">" + (.git.branch // "?") + "</td>" +
+    "<td>" + (if .git.dirty_count > 0 then "<span class=\"check no\">" + (.git.dirty_count | tostring) + "</span>" else "<span class=\"check yes\">0</span>" end) + "</td>" +
+    "<td>" + (if .git.unpushed > 0 then "<span class=\"check no\">" + (.git.unpushed | tostring) + "</span>" elif .git.unpushed == -1 then "<span class=\"dim\">?</span>" else "<span class=\"check yes\">0</span>" end) + "</td>" +
+    "<td>" + (if .git.stash_count > 0 then "<span class=\"check no\">" + (.git.stash_count | tostring) + "</span>" else "<span class=\"dim\">0</span>" end) + "</td>" +
+    "<td><span class=\"check " + (if .git.has_remote then "yes\">&#10003;" else "no\">&#10007;" end) + "</span></td>" +
+    "<td><span class=\"check " + (if .docs.has_readme then "yes\">&#10003;" else "no\">&#10007;" end) + "</span></td>" +
+    "<td><span class=\"check " + (if .docs.has_claude_md then "yes\">&#10003;" else "no\">&#10007;" end) + "</span></td>" +
+    "<td><span class=\"check " + (if .beads.has_beads then "yes\">&#10003;" else "no\">&#10007;" end) + "</span></td>" +
+    "<td class=\"dim\">" + (if .git.last_commit_age_days > 30 then (.git.last_commit_age_days | tostring) + "d ago" elif .git.last_commit_age_days > 0 then (.git.last_commit_age_days | tostring) + "d ago" else "today" end) + "</td>" +
+    "</tr>"
+  ' >> "$HTML_FILE"
+
+  cat >> "$HTML_FILE" <<'HTMLFOOT'
+</table>
+</div>
+</body>
+</html>
+HTMLFOOT
+
+  echo "HTML report written to: $HTML_FILE" >&2
+fi
