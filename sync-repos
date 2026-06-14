@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Sync repos in ~/src with their upstream remotes
+
+SRC_DIR="$HOME/src"
+
+# If arguments provided, only sync those repos
+if [[ $# -gt 0 ]]; then
+	repos_to_sync=("$@")
+else
+	# Otherwise, find all repos that need syncing
+	repos_to_sync=()
+	for repo_dir in "$SRC_DIR"/*; do
+		[[ ! -d "$repo_dir" ]] && continue
+		[[ ! -d "$repo_dir/.git" ]] && continue
+
+		repo_name=$(basename "$repo_dir")
+		cd "$repo_dir" || continue
+
+		if git remote | grep -q "upstream"; then
+			git fetch upstream >/dev/null 2>&1
+
+			default_branch=$(git rev-parse --abbrev-ref upstream/HEAD 2>/dev/null | sed 's|upstream/||')
+
+			if [[ -z "$default_branch" ]]; then
+				default_branch=$(git symbolic-ref refs/remotes/upstream/HEAD 2>/dev/null | sed 's|refs/remotes/upstream/||')
+			fi
+
+			if [[ -n "$default_branch" ]]; then
+				behind_count=$(git rev-list --left-right --count "upstream/$default_branch...HEAD" 2>/dev/null | awk '{print $1}')
+
+				if [[ "$behind_count" -gt 0 ]]; then
+					repos_to_sync+=("$repo_name")
+				fi
+			fi
+		fi
+	done
+fi
+
+# Sync each repo
+for repo_name in "${repos_to_sync[@]}"; do
+	repo_dir="$SRC_DIR/$repo_name"
+	[[ ! -d "$repo_dir/.git" ]] && continue
+
+	echo "Syncing $repo_name..."
+
+	cd "$repo_dir" || continue
+
+	# Fetch upstream
+	git fetch upstream
+
+	# Get default branch
+	default_branch=$(git rev-parse --abbrev-ref upstream/HEAD 2>/dev/null | sed 's|upstream/||')
+
+	if [[ -z "$default_branch" ]]; then
+		default_branch=$(git symbolic-ref refs/remotes/upstream/HEAD 2>/dev/null | sed 's|refs/remotes/upstream/||')
+	fi
+
+	if [[ -n "$default_branch" ]]; then
+		# Merge upstream/default_branch into local/default_branch
+		git checkout "$default_branch" 2>/dev/null
+		git merge "upstream/$default_branch"
+		echo "  ✓ Merged upstream/$default_branch into $default_branch"
+	fi
+done
+
+echo "Done!"

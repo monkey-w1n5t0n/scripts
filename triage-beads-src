@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""
+Triage beads_src issues by finding which Claude Code sessions mentioned each
+issue ID, using the cwd of the *specific message* where the ID appeared.
+"""
+
+import json
+import os
+import re
+import sys
+from collections import defaultdict, Counter
+from pathlib import Path
+
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+ISSUES_FILE = Path("/tmp/beads_src_issues.json")
+
+# ── load issues ────────────────────────────────────────────────────────────────
+
+if not ISSUES_FILE.exists():
+    print("ERROR: /tmp/beads_src_issues.json not found.", file=sys.stderr)
+    sys.exit(1)
+
+with open(ISSUES_FILE) as f:
+    issues = json.load(f)
+
+issue_ids = [i["id"] for i in issues]
+issue_map = {i["id"]: i for i in issues}
+
+escaped = [re.escape(iid) for iid in sorted(issue_ids, key=len, reverse=True)]
+ISSUE_RE = re.compile(r'(?<![a-zA-Z0-9._-])(' + '|'.join(escaped) + r')(?![a-zA-Z0-9._-])')
+
+# ── extract text content from a message entry ──────────────────────────────────
+
+def iter_text_blocks(message):
+    """Yield (text, block_type) for each text-bearing block in a message."""
+    if not message:
+        return
+    content = message.get("content", "")
+    if isinstance(content, str):
+        yield content, "text"
+        return
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type", "")
+            for key in ("text", "thinking"):
+                if key in block and block[key]:
+                    yield block[key], btype
+            # tool_result can have nested content
+            if btype == "tool_result":
+                inner = block.get("content", "")
+                if isinstance(inner, str) and inner:
+                    yield inner, "tool_result"
+                elif isinstance(inner, list):
+                    for ib in inner:
+                        if isinstance(ib, dict) and ib.get("text"):
+                            yield ib["text"], "tool_result"
+            # tool_use input
+            if btype == "tool_use" and "input" in block:
+                inp = block["input"]
+                yield (inp if isinstance(inp, str) else json.dumps(inp)), "tool_use"
+
+# ── scan all project chat logs ─────────────────────────────────────────────────
+# hits[issue_id] -> Counter of cwd (from the message where the hit occurred)
+# weighted by block type: tool_result > tool_use > text > thinking
+
+BLOCK_WEIGHT = {"tool_result": 4, "tool_use": 3, "text": 1, "thinking": 0}
+
+hits = defaultdict(Counter)   # iid -> Counter{cwd: weight}
+
+print(f"Scanning {PROJECTS_DIR} ...", file=sys.stderr)
+
+n_files = 0
+for project_dir in sorted(PROJECTS_DIR.iterdir()):
+    if not project_dir.is_dir():
+        continue
+    for jsonl_file in project_dir.glob("*.jsonl"):
+        # quick pre-check: does this file mention any issue ID at all?
+        try:
+            raw = jsonl_file.read_text(errors="replace")
+        except Exception:
+            continue
+        if not ISSUE_RE.search(raw):
+            continue
+
+        n_files += 1
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            cwd = entry.get("cwd", "").strip()
+            if not cwd:
+                continue
+
+            msg = entry.get("message", {})
+            for text, btype in iter_text_blocks(msg):
+                weight = BLOCK_WEIGHT.get(btype, 1)
+                for match in ISSUE_RE.finditer(text):
+                    iid = match.group(1)
+                    hits[iid][cwd] += weight
+
+print(f"Scanned {n_files} files containing issue IDs.", file=sys.stderr)
+
+# ── extract repo from cwd ──────────────────────────────────────────────────────
+
+SRC_ROOT = str(Path.home() / "src")
+
+def cwd_to_repo(cwd):
+    """Extract the immediate sub-repo name from a cwd under ~/src, or None."""
+    if not cwd.startswith(SRC_ROOT + "/"):
+        return None
+    rest = cwd[len(SRC_ROOT)+1:]
+    repo = rest.split("/")[0]
+    return repo if repo else None
+
+def score_issue(iid):
+    """Return Counter{repo: weighted_score} for this issue."""
+    repo_scores = Counter()
+    for cwd, weight in hits.get(iid, {}).items():
+        repo = cwd_to_repo(cwd)
+        if repo:
+            repo_scores[repo] += weight
+    return repo_scores
+
+# ── print report ───────────────────────────────────────────────────────────────
+
+prefix_groups = defaultdict(list)
+for iid in issue_ids:
+    prefix_groups[iid.split('-')[0]].append(iid)
+
+total_confident = 0
+total_ambiguous = 0
+total_no_hits = 0
+auto_assignments = {}
+
+print(f"\n{'─'*72}")
+print(f"  beads_src issue triage  ({len(issue_ids)} issues)")
+print(f"{'─'*72}\n")
+
+for prefix in sorted(prefix_groups.keys()):
+    ids = sorted(prefix_groups[prefix])
+    print(f"  ── {prefix}- ({len(ids)} issues) ──────────────────")
+    for iid in ids:
+        issue = issue_map[iid]
+        scored = score_issue(iid).most_common()
+        title = issue.get("title", "")[:58]
+
+        if not scored:
+            marker = "  ?"
+            detail = "no cwd signal found"
+            total_no_hits += 1
+        else:
+            top_repo, top_score = scored[0]
+            second_score = scored[1][1] if len(scored) > 1 else 0
+            ratio = top_score / second_score if second_score else float("inf")
+
+            if ratio >= 2.0:
+                marker = "  ✓"
+                others = f"  (vs {scored[1][0]}:{scored[1][1]})" if len(scored) > 1 else ""
+                detail = f"→ {top_repo}  [score:{top_score}{others}]"
+                auto_assignments[iid] = top_repo
+                total_confident += 1
+            else:
+                marker = "  ~"
+                detail = "  ambiguous: " + ", ".join(f"{r}:{s}" for r, s in scored[:4])
+                total_ambiguous += 1
+
+        print(f"{marker}  {iid:<38}  {title}")
+        print(f"       {detail}")
+    print()
+
+print(f"{'─'*72}")
+print(f"  Summary:")
+print(f"    ✓ confident auto-assignment:  {total_confident}")
+print(f"    ~ ambiguous (needs manual):   {total_ambiguous}")
+print(f"    ? no cwd signal found:        {total_no_hits}")
+print(f"{'─'*72}\n")
+
+# ── write output ───────────────────────────────────────────────────────────────
+
+by_repo = defaultdict(list)
+for iid, repo in auto_assignments.items():
+    by_repo[repo].append(iid)
+
+output = {
+    "auto_assignments": dict(by_repo),
+    "unresolved": [iid for iid in issue_ids if iid not in auto_assignments],
+}
+
+out_path = "/tmp/beads-triage-auto.json"
+with open(out_path, "w") as f:
+    json.dump(output, f, indent=2)
+
+print(f"  Auto-assignments written to {out_path}\n")

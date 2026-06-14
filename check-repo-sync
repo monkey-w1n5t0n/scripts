@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Check which repos in ~/src need syncing with upstream
+
+SRC_DIR="$HOME/src"
+
+for repo_dir in "$SRC_DIR"/*; do
+	# Skip if not a directory
+	[[ ! -d "$repo_dir" ]] && continue
+
+	# Skip if not a git repo
+	[[ ! -d "$repo_dir/.git" ]] && continue
+
+	repo_name=$(basename "$repo_dir")
+
+	cd "$repo_dir" || continue
+
+	# Check if there's an upstream remote
+	if git remote | grep -q "upstream"; then
+		# Fetch upstream to check for updates
+		git fetch upstream >/dev/null 2>&1
+
+		# Get the default branch
+		default_branch=$(git rev-parse --abbrev-ref upstream/HEAD 2>/dev/null | sed 's|upstream/||')
+
+		if [[ -z "$default_branch" ]]; then
+			# Try to guess the default branch
+			default_branch=$(git symbolic-ref refs/remotes/upstream/HEAD 2>/dev/null | sed 's|refs/remotes/upstream/||')
+		fi
+
+		if [[ -n "$default_branch" ]]; then
+			# Check if upstream/default_branch is ahead of local/default_branch
+			behind_count=$(git rev-list --left-right --count "upstream/$default_branch...HEAD" 2>/dev/null | awk '{print $1}')
+
+			if [[ "$behind_count" -gt 0 ]]; then
+				# Upstream has commits we don't have
+				echo "$repo_name"
+			fi
+		fi
+	fi
+done

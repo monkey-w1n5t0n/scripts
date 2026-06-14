@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# List all repos the user has access to
+
+gh repo list --limit 1000 --json nameWithOwner --jq '.[].nameWithOwner'

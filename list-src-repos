@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# List repos that should be in ~/src (all repos minus those in .gt-ignore)
+
+GT_IGNORE="$HOME/src/.gt-ignore"
+
+# Get all repos and filter
+all_repos=$(gh repo list --limit 1000 --json nameWithOwner --jq '.[].nameWithOwner')
+
+# Filter out repos in .gt-ignore
+if [[ -f "$GT_IGNORE" ]]; then
+	while IFS= read -r repo; do
+		# Check if repo (or just the name part) is in ignore list
+		repo_name="${repo##*/}"
+
+		if ! grep -qx "$repo" "$GT_IGNORE" && ! grep -qx "$repo_name" "$GT_IGNORE"; then
+			echo "$repo"
+		fi
+	done <<< "$all_repos"
+else
+	# No ignore file, return all repos
+	echo "$all_repos"
+fi

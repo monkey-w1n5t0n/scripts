@@ -1,0 +1,137 @@
+#!/bin/bash
+# bd-remote: Push/pull beads dolt databases to/from VPS via SSH tunnel
+#
+# Usage:
+#   bd-remote push [project]     Push beads to VPS (current project or named)
+#   bd-remote pull [project]     Pull beads from VPS
+#   bd-remote push-all           Push all projects with dolt remotes
+#   bd-remote status             Show which projects have remotes configured
+#
+# The SSH tunnel is opened and closed automatically per operation.
+
+set -euo pipefail
+
+VPS_HOST="w1n5t0n@lnfinitemonkeys.org"
+TUNNEL_PORT=50051
+SRC_DIR="$HOME/src"
+
+open_tunnel() {
+    # Check if tunnel already exists
+    if lsof -i "tcp:$TUNNEL_PORT" &>/dev/null; then
+        return 0
+    fi
+    ssh -f -N -L "$TUNNEL_PORT:127.0.0.1:$TUNNEL_PORT" "$VPS_HOST"
+    sleep 1
+}
+
+close_tunnel() {
+    pkill -f "ssh -f -N -L $TUNNEL_PORT" 2>/dev/null || true
+}
+
+find_dolt_dir() {
+    local project="$1"
+    local doltdir="$SRC_DIR/$project/.beads/dolt"
+    if [ ! -d "$doltdir" ]; then
+        echo "Error: no dolt database at $doltdir" >&2
+        return 1
+    fi
+    echo "$doltdir"
+}
+
+current_project() {
+    local cwd="$PWD"
+    if [[ "$cwd" == "$SRC_DIR"/* ]]; then
+        # Extract project name (first path component after ~/src/)
+        local rel="${cwd#$SRC_DIR/}"
+        echo "${rel%%/*}"
+    else
+        echo "Error: not in ~/src/" >&2
+        return 1
+    fi
+}
+
+do_push() {
+    local project="${1:-$(current_project)}"
+    local doltdir
+    doltdir=$(find_dolt_dir "$project")
+
+    open_tunnel
+    trap close_tunnel EXIT
+
+    cd "$doltdir"
+    echo "Pushing $project..."
+    DOLT_REMOTE_PASSWORD="" dolt push --user root origin main
+    echo "Done."
+}
+
+do_pull() {
+    local project="${1:-$(current_project)}"
+    local doltdir
+    doltdir=$(find_dolt_dir "$project")
+
+    open_tunnel
+    trap close_tunnel EXIT
+
+    cd "$doltdir"
+    echo "Pulling $project..."
+    DOLT_REMOTE_PASSWORD="" dolt pull --user root origin main
+    echo "Done."
+}
+
+do_push_all() {
+    open_tunnel
+    trap close_tunnel EXIT
+
+    local ok=0
+    local fail=0
+
+    for doltdir in "$SRC_DIR"/*/.beads/dolt; do
+        [ -d "$doltdir" ] || continue
+
+        # Check if remote is configured
+        if ! (cd "$doltdir" && dolt remote -v 2>/dev/null | grep -q origin); then
+            continue
+        fi
+
+        local project
+        project=$(basename "$(dirname "$(dirname "$doltdir")")")
+
+        cd "$doltdir"
+        if DOLT_REMOTE_PASSWORD="" dolt push --user root origin main 2>&1 | tail -1; then
+            echo "OK: $project"
+            ok=$((ok + 1))
+        else
+            echo "FAIL: $project"
+            fail=$((fail + 1))
+        fi
+    done
+
+    echo ""
+    echo "Pushed: $ok  Failed: $fail"
+}
+
+do_status() {
+    echo "Projects with dolt remotes configured:"
+    echo ""
+    for doltdir in "$SRC_DIR"/*/.beads/dolt; do
+        [ -d "$doltdir" ] || continue
+        local project
+        project=$(basename "$(dirname "$(dirname "$doltdir")")")
+        local remote
+        remote=$(cd "$doltdir" && dolt remote -v 2>/dev/null | grep origin | head -1 || true)
+        if [ -n "$remote" ]; then
+            echo "  $project"
+        fi
+    done
+}
+
+case "${1:-help}" in
+    push)     do_push "${2:-}" ;;
+    pull)     do_pull "${2:-}" ;;
+    push-all) do_push_all ;;
+    status)   do_status ;;
+    *)
+        echo "Usage: bd-remote {push|pull|push-all|status} [project]"
+        exit 1
+        ;;
+esac

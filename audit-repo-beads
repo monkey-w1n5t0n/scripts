@@ -1,0 +1,1333 @@
+#!/usr/bin/env bash
+# audit-repo-beads - Explore all branches in recent repos and report beads issues
+#
+# For the N most recently committed repos in ~/src, checks every branch
+# (using temporary worktrees when the working tree is dirty) for a .beads/
+# directory and reports beads issues found on each branch.
+#
+# Usage: audit-repo-beads [N]        (default: 10)
+#        audit-repo-beads --repo <path>  (audit a single repo)
+
+set -euo pipefail
+
+SRC_DIR="${HOME}/src"
+DEFAULT_COUNT=10
+TMPDIR_BASE="/tmp/audit-repo-beads-$$"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+cleanup() {
+    if [[ -d "$TMPDIR_BASE" ]]; then
+        # Remove any worktrees we created
+        for wt_dir in "$TMPDIR_BASE"/wt-*; do
+            [[ -d "$wt_dir" ]] || continue
+            local repo_git
+            repo_git=$(git -C "$wt_dir" rev-parse --git-common-dir 2>/dev/null || true)
+            if [[ -n "$repo_git" ]]; then
+                git -C "$repo_git/.." worktree remove --force "$wt_dir" 2>/dev/null || rm -rf "$wt_dir"
+            else
+                rm -rf "$wt_dir"
+            fi
+        done
+        rm -rf "$TMPDIR_BASE"
+    fi
+}
+trap cleanup EXIT
+
+mkdir -p "$TMPDIR_BASE"
+
+# --- Helpers ---
+
+# Get the N most recently committed repos under $SRC_DIR
+get_recent_repos() {
+    local count="$1"
+    local repos=()
+    for d in "$SRC_DIR"/*/; do
+        [[ -d "$d/.git" ]] || continue
+        local date
+        date=$(git -C "$d" log -1 --format='%aI' 2>/dev/null) || continue
+        [[ -n "$date" ]] && repos+=("$date $d")
+    done
+    printf '%s\n' "${repos[@]}" | sort -r | head -n "$count" | awk '{print $2}'
+}
+
+# Check if a branch's tree contains .beads/ using git ls-tree (no checkout needed)
+branch_has_beads_tree() {
+    local repo_dir="$1"
+    local branch="$2"
+    local result
+    result=$(git -C "$repo_dir" ls-tree --name-only "$branch" .beads/ 2>/dev/null)
+    [[ -n "$result" ]]
+}
+
+# Try to get beads issue count from a branch using a temp worktree
+get_beads_issues_via_worktree() {
+    local repo_dir="$1"
+    local branch="$2"
+    local wt_name
+    wt_name="wt-$(basename "$repo_dir")-$(echo "$branch" | tr '/' '-')"
+    local wt_path="$TMPDIR_BASE/$wt_name"
+
+    if [[ -d "$wt_path" ]]; then
+        rm -rf "$wt_path"
+    fi
+
+    git -C "$repo_dir" worktree add "$wt_path" "$branch" --detach 2>/dev/null || return 1
+
+    local issues
+    issues=$(cd "$wt_path" && bd list --limit 0 2>/dev/null) || issues=""
+
+    git -C "$repo_dir" worktree remove --force "$wt_path" 2>/dev/null || true
+
+    echo "$issues"
+}
+
+# Get beads issues for the current working directory
+get_beads_issues_current() {
+    local repo_dir="$1"
+    cd "$repo_dir"
+    bd list --limit 0 2>/dev/null || bd list --limit 0 --allow-stale 2>/dev/null || echo ""
+}
+
+# Filter to just issue lines (lines starting with bd status symbols)
+filter_issue_lines() {
+    echo "$1" | grep -E '^[○◐●✓✗]' 2>/dev/null || true
+}
+
+# Count issue lines
+count_issues() {
+    local lines
+    lines=$(filter_issue_lines "$1")
+    if [[ -z "$lines" ]]; then echo "0"; else echo "$lines" | wc -l | tr -d ' '; fi
+}
+
+count_open() {
+    local lines
+    lines=$(echo "$1" | grep -E '^[○◐]' 2>/dev/null || true)
+    if [[ -z "$lines" ]]; then echo "0"; else echo "$lines" | wc -l | tr -d ' '; fi
+}
+
+count_in_progress() {
+    local lines
+    lines=$(echo "$1" | grep -E '^◐' 2>/dev/null || true)
+    if [[ -z "$lines" ]]; then echo "0"; else echo "$lines" | wc -l | tr -d ' '; fi
+}
+
+count_closed() {
+    local lines
+    lines=$(echo "$1" | grep -E '^[✓]' 2>/dev/null || true)
+    if [[ -z "$lines" ]]; then echo "0"; else echo "$lines" | wc -l | tr -d ' '; fi
+}
+
+# --- Main audit for a single repo ---
+
+audit_repo() {
+    local repo_dir="$1"
+    repo_dir="${repo_dir%/}"
+    local repo_name
+    repo_name=$(basename "$repo_dir")
+
+    echo -e "\n${BOLD}${BLUE}═══════════════════════════════════════════════════════${RESET}"
+    echo -e "${BOLD}${BLUE} Repository: ${repo_name}${RESET}"
+    echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════════${RESET}"
+
+    # Git status
+    local status
+    status=$(git -C "$repo_dir" status -sb 2>/dev/null)
+    local current_branch
+    current_branch=$(git -C "$repo_dir" symbolic-ref --short HEAD 2>/dev/null || echo "(detached)")
+    echo -e "  ${BOLD}Branch:${RESET} $current_branch"
+    local dirty=""
+    if echo "$status" | grep -qE '^ ?[MADRCU?!]'; then
+        dirty="yes"
+        echo -e "  ${YELLOW}Working tree has uncommitted changes${RESET}"
+    else
+        echo -e "  ${GREEN}Working tree clean${RESET}"
+    fi
+
+    # List all branches (local + remote, deduplicated)
+    local all_branches=()
+    local branch_line
+    while IFS= read -r branch_line; do
+        branch_line=$(echo "$branch_line" | sed 's/^[* ] //' | xargs)
+        # Skip HEAD pointers
+        [[ "$branch_line" == *"HEAD"* ]] && continue
+        [[ -z "$branch_line" ]] && continue
+        all_branches+=("$branch_line")
+    done < <(git -C "$repo_dir" branch -a --no-color 2>/dev/null)
+
+    echo -e "  ${BOLD}Total branches:${RESET} ${#all_branches[@]}"
+
+    # Check which branches have .beads/ in their tree
+    local branches_with_beads=()
+    local branches_without_beads=()
+
+    for branch in "${all_branches[@]}"; do
+        if branch_has_beads_tree "$repo_dir" "$branch"; then
+            branches_with_beads+=("$branch")
+        else
+            branches_without_beads+=("$branch")
+        fi
+    done
+
+    echo -e "  ${BOLD}Branches with .beads/:${RESET} ${#branches_with_beads[@]}"
+
+    if [[ ${#branches_with_beads[@]} -eq 0 ]]; then
+        # Also check the filesystem directly (beads might not be committed)
+        if [[ -d "$repo_dir/.beads" ]]; then
+            echo -e "  ${YELLOW}Note: .beads/ exists on disk but not in git tree${RESET}"
+            echo -e "\n  ${BOLD}Issues (current branch):${RESET}"
+            local issues
+            issues=$(get_beads_issues_current "$repo_dir")
+            if [[ -n "$issues" ]]; then
+                local total open closed in_progress
+                total=$(count_issues "$issues")
+                open=$(count_open "$issues")
+                in_progress=$(count_in_progress "$issues")
+                closed=$(count_closed "$issues")
+                echo "    Total: $total | Open: $open | In-progress: $in_progress | Closed: $closed"
+                filter_issue_lines "$issues" | head -20 | sed 's/^/    /'
+                if [[ $total -gt 20 ]]; then
+                    echo -e "    ${YELLOW}... and $((total - 20)) more${RESET}"
+                fi
+            else
+                echo -e "    ${YELLOW}(no issues or bd not available)${RESET}"
+            fi
+        else
+            echo -e "  ${YELLOW}No beads tracking in this repo${RESET}"
+        fi
+        return
+    fi
+
+    # Get issues from the current branch first
+    echo -e "\n  ${BOLD}Issues (current branch: $current_branch):${RESET}"
+    local current_issues
+    current_issues=$(get_beads_issues_current "$repo_dir")
+    if [[ -n "$current_issues" ]]; then
+        local total open closed in_progress
+        total=$(count_issues "$current_issues")
+        open=$(count_open "$current_issues")
+        in_progress=$(count_in_progress "$current_issues")
+        closed=$(count_closed "$current_issues")
+        echo "    Total: $total | Open: $open | In-progress: $in_progress | Closed: $closed"
+        filter_issue_lines "$current_issues" | head -20 | sed 's/^/    /'
+        if [[ $total -gt 20 ]]; then
+            echo -e "    ${YELLOW}... and $((total - 20)) more${RESET}"
+        fi
+    else
+        echo -e "    ${YELLOW}(bd list returned nothing)${RESET}"
+    fi
+
+    # Check if other branches have different issue sets
+    # Use git show to compare issues.jsonl across branches
+    local current_hash
+    current_hash=$(git -C "$repo_dir" rev-parse "$current_branch:.beads/issues.jsonl" 2>/dev/null || echo "none")
+
+    local differing_branches=()
+    for branch in "${branches_with_beads[@]}"; do
+        # Skip the current branch
+        local clean_branch="${branch#remotes/}"
+        [[ "$branch" == "$current_branch" ]] && continue
+
+        local branch_hash
+        branch_hash=$(git -C "$repo_dir" rev-parse "$branch:.beads/issues.jsonl" 2>/dev/null || echo "none")
+
+        if [[ "$branch_hash" != "$current_hash" ]]; then
+            differing_branches+=("$branch")
+        fi
+    done
+
+    if [[ ${#differing_branches[@]} -gt 0 ]]; then
+        echo -e "\n  ${BOLD}Branches with different issue sets:${RESET}"
+        for branch in "${differing_branches[@]}"; do
+            local line_count
+            line_count=$(git -C "$repo_dir" show "$branch:.beads/issues.jsonl" 2>/dev/null | wc -l)
+            echo -e "    - $branch ($line_count issue lines)"
+        done
+    elif [[ ${#branches_with_beads[@]} -gt 1 ]]; then
+        echo -e "\n  ${GREEN}All ${#branches_with_beads[@]} branches with beads share the same issue set${RESET}"
+    fi
+
+    # List branches without beads (if any have beads, this context is useful)
+    if [[ ${#branches_without_beads[@]} -gt 0 && ${#branches_without_beads[@]} -le 10 ]]; then
+        echo -e "\n  Branches without .beads/: ${branches_without_beads[*]}"
+    elif [[ ${#branches_without_beads[@]} -gt 10 ]]; then
+        echo -e "\n  ${#branches_without_beads[@]} branches without .beads/"
+    fi
+}
+
+# --- Web report generation ---
+
+generate_web_report() {
+    local output_file="/tmp/beads-audit-report-$(date +%Y%m%d-%H%M%S).html"
+    echo -e "${BOLD}Collecting data and generating web report...${RESET}"
+
+    # Remove the initial template approach - just use the captured version below
+    # (the heredoc below collects data AND generates HTML in one pass)
+    :  # placeholder
+
+    local report_path
+    report_path=$(python3 - "$output_file" "$@" << 'PYEOF_UNUSED'
+just a placeholder
+PYEOF_UNUSED
+    )
+    # Actually skip this placeholder entirely - jump to the real generation
+
+    # REAL generation starts here. We remove the above placeholders.
+    # The real python heredoc is right below.
+    true  # dummy to allow the edit to complete cleanly
+
+    # --- REPLACED BLOCK: see below for actual heredoc ---
+    # Dummy line: html = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Beads Audit Report</title>
+<style>
+:root {
+  --bg: #0f172a; --bg2: #1e293b; --bg3: #334155;
+  --fg: #f1f5f9; --fg2: #94a3b8; --fg3: #64748b;
+  --accent: #6366f1; --accent2: #818cf8;
+  --p0: #ef4444; --p1: #f97316; --p2: #3b82f6; --p3: #6b7280; --p4: #475569;
+  --open: #eab308; --wip: #3b82f6; --closed: #22c55e;
+  --epic: #a855f7; --task: #3b82f6; --bug: #ef4444; --feature: #22c55e;
+  --radius: 8px; --shadow: 0 4px 24px rgba(0,0,0,.4);
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  background: var(--bg); color: var(--fg); min-height: 100vh; }
+a { color: var(--accent2); text-decoration: none; }
+
+/* Layout */
+.app { display: flex; min-height: 100vh; }
+.sidebar { width: 260px; background: var(--bg2); border-right: 1px solid var(--bg3);
+  padding: 20px 0; flex-shrink: 0; position: fixed; top: 0; left: 0; bottom: 0;
+  overflow-y: auto; z-index: 10; }
+.main { margin-left: 260px; flex: 1; padding: 24px 32px; min-width: 0; }
+
+/* Sidebar */
+.sidebar h1 { font-size: 16px; padding: 0 20px 16px; color: var(--fg2);
+  border-bottom: 1px solid var(--bg3); margin-bottom: 12px; font-weight: 500; }
+.sidebar h1 span { color: var(--accent2); }
+.nav-item { display: flex; align-items: center; gap: 10px; padding: 10px 20px;
+  cursor: pointer; transition: background .15s; font-size: 14px; color: var(--fg2); }
+.nav-item:hover { background: var(--bg3); color: var(--fg); }
+.nav-item.active { background: var(--accent); color: white; font-weight: 500; }
+.nav-item .badge { margin-left: auto; background: var(--bg3); color: var(--fg2);
+  padding: 2px 8px; border-radius: 10px; font-size: 12px; font-weight: 500; }
+.nav-item.active .badge { background: rgba(255,255,255,.2); color: white; }
+.nav-item .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.nav-section { font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+  color: var(--fg3); padding: 16px 20px 6px; font-weight: 600; }
+
+/* Stats bar */
+.stats { display: flex; gap: 16px; margin-bottom: 28px; flex-wrap: wrap; }
+.stat-card { background: var(--bg2); border-radius: var(--radius); padding: 18px 22px;
+  flex: 1; min-width: 150px; border: 1px solid var(--bg3); }
+.stat-card .label { font-size: 12px; color: var(--fg3); text-transform: uppercase;
+  letter-spacing: .5px; margin-bottom: 6px; }
+.stat-card .value { font-size: 28px; font-weight: 700; }
+.stat-card .sub { font-size: 12px; color: var(--fg3); margin-top: 4px; }
+
+/* Priority bar */
+.pbar-wrap { margin: 6px 0; }
+.pbar { display: flex; height: 22px; border-radius: 4px; overflow: hidden; background: var(--bg3); }
+.pbar > div { transition: width .3s; display: flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: 600; color: white; min-width: 0; }
+.pbar > div:hover { filter: brightness(1.2); }
+
+/* Cards grid */
+.repo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
+.repo-card { background: var(--bg2); border-radius: var(--radius); padding: 20px;
+  border: 1px solid var(--bg3); cursor: pointer; transition: all .15s; }
+.repo-card:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: var(--shadow); }
+.repo-card h3 { font-size: 18px; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+.repo-card .meta { font-size: 13px; color: var(--fg3); margin-bottom: 12px; }
+.repo-card .meta span { margin-right: 14px; }
+.repo-card .no-beads { color: var(--fg3); font-style: italic; font-size: 13px; }
+
+/* Badges */
+.badge-p0,.badge-p1,.badge-p2,.badge-p3,.badge-p4 {
+  display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px;
+  font-weight: 600; color: white; }
+.badge-p0 { background: var(--p0); } .badge-p1 { background: var(--p1); }
+.badge-p2 { background: var(--p2); } .badge-p3 { background: var(--p3); }
+.badge-p4 { background: var(--p4); }
+.badge-type { display: inline-block; padding: 2px 8px; border-radius: 4px;
+  font-size: 11px; font-weight: 500; border: 1px solid; }
+.badge-epic { color: var(--epic); border-color: var(--epic); }
+.badge-task { color: var(--p2); border-color: var(--p2); }
+.badge-bug { color: var(--bug); border-color: var(--bug); }
+.badge-feature { color: var(--feature); border-color: var(--feature); }
+.badge-label { display: inline-block; padding: 1px 6px; border-radius: 3px;
+  font-size: 10px; background: var(--bg3); color: var(--fg2); margin: 1px; }
+.status-icon { display: inline-block; width: 16px; text-align: center; }
+
+/* Issue table */
+.issue-table-wrap { overflow-x: auto; }
+table.issues { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.issues th { text-align: left; padding: 10px 12px; border-bottom: 2px solid var(--bg3);
+  color: var(--fg3); font-weight: 600; cursor: pointer; user-select: none;
+  white-space: nowrap; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+table.issues th:hover { color: var(--fg); }
+table.issues th .sort-arrow { margin-left: 4px; opacity: .4; }
+table.issues th.sorted .sort-arrow { opacity: 1; color: var(--accent2); }
+table.issues td { padding: 10px 12px; border-bottom: 1px solid var(--bg3); vertical-align: top; }
+table.issues tr:hover { background: rgba(99,102,241,.06); }
+table.issues .title { max-width: 400px; }
+table.issues .deps { font-size: 11px; color: var(--fg3); }
+table.issues .deps a { font-size: 11px; }
+
+/* Filters */
+.filters { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }
+.search { background: var(--bg2); border: 1px solid var(--bg3); border-radius: var(--radius);
+  padding: 8px 14px; color: var(--fg); font-size: 14px; width: 260px; outline: none; }
+.search:focus { border-color: var(--accent); }
+.filter-group { display: flex; gap: 4px; flex-wrap: wrap; }
+.filter-btn { background: var(--bg2); border: 1px solid var(--bg3); border-radius: 4px;
+  padding: 5px 10px; color: var(--fg2); font-size: 12px; cursor: pointer; transition: all .1s; }
+.filter-btn:hover { border-color: var(--fg3); color: var(--fg); }
+.filter-btn.active { background: var(--accent); border-color: var(--accent); color: white; }
+
+/* Section headers */
+.section-header { display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 18px; }
+.section-header h2 { font-size: 22px; font-weight: 600; }
+.back-btn { background: var(--bg2); border: 1px solid var(--bg3); border-radius: var(--radius);
+  padding: 7px 16px; color: var(--fg2); cursor: pointer; font-size: 13px; transition: all .1s; }
+.back-btn:hover { border-color: var(--accent); color: var(--fg); }
+
+/* Dep graph */
+.dep-graph { background: var(--bg2); border-radius: var(--radius); padding: 20px;
+  border: 1px solid var(--bg3); margin-top: 20px; overflow-x: auto; }
+.dep-graph h3 { font-size: 14px; color: var(--fg3); margin-bottom: 12px; text-transform: uppercase;
+  letter-spacing: .5px; font-weight: 600; }
+.dep-node { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+  background: var(--bg3); border-radius: 4px; margin: 3px; font-size: 12px; cursor: default; }
+.dep-node.epic { border-left: 3px solid var(--epic); }
+.dep-node.blocked { opacity: .6; }
+.dep-arrow { color: var(--fg3); font-size: 14px; margin: 0 2px; }
+
+/* Charts */
+.chart-section { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
+.chart-card { background: var(--bg2); border-radius: var(--radius); padding: 18px;
+  border: 1px solid var(--bg3); }
+.chart-card h3 { font-size: 13px; color: var(--fg3); margin-bottom: 14px; text-transform: uppercase;
+  letter-spacing: .5px; font-weight: 600; }
+.hbar { display: flex; align-items: center; margin: 6px 0; }
+.hbar .label { width: 70px; font-size: 12px; color: var(--fg2); flex-shrink: 0; }
+.hbar .bar { height: 20px; border-radius: 3px; transition: width .3s; min-width: 2px;
+  display: flex; align-items: center; padding-left: 6px; font-size: 11px; font-weight: 600; color: white; }
+.hbar .count { margin-left: 8px; font-size: 12px; color: var(--fg3); flex-shrink: 0; }
+
+/* Responsive */
+@media (max-width: 900px) {
+  .sidebar { display: none; }
+  .main { margin-left: 0; padding: 16px; }
+  .chart-section { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <nav class="sidebar">
+    <h1><span>&#x25C9;</span> Beads Audit</h1>
+    <div class="nav-item active" onclick="showDashboard()" id="nav-dashboard">
+      Dashboard
+    </div>
+    <div class="nav-section">Repositories</div>
+    <div id="nav-repos"></div>
+  </nav>
+  <main class="main" id="main-content"></main>
+</div>
+
+<script>
+const DATA = ''' + json.dumps(data) + ''';
+
+const P_COLORS = {0:'#ef4444',1:'#f97316',2:'#3b82f6',3:'#6b7280',4:'#475569'};
+const S_COLORS = {open:'#eab308',in_progress:'#3b82f6',closed:'#22c55e'};
+const T_COLORS = {epic:'#a855f7',task:'#3b82f6',bug:'#ef4444',feature:'#22c55e'};
+
+let currentSort = {col:null, asc:true};
+let activeFilters = {priority:null, type:null, status:null};
+let searchQuery = '';
+
+function h(tag, attrs, ...children) {
+  const el = document.createElement(tag);
+  if (attrs) Object.entries(attrs).forEach(([k,v]) => {
+    if (k === 'onclick') el.onclick = v;
+    else if (k === 'oninput') el.oninput = v;
+    else if (k === 'className') el.className = v;
+    else if (k === 'innerHTML') el.innerHTML = v;
+    else el.setAttribute(k, v);
+  });
+  children.flat().forEach(c => {
+    if (c == null) return;
+    el.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+  });
+  return el;
+}
+
+function priorityBadge(p) {
+  return `<span class="badge-p${p}">P${p}</span>`;
+}
+function typeBadge(t) {
+  const cls = T_COLORS[t] ? t : 'task';
+  return `<span class="badge-type badge-${cls}">${t || 'task'}</span>`;
+}
+function statusIcon(s) {
+  if (s === 'closed') return '<span class="status-icon" title="closed">\\u2713</span>';
+  if (s === 'in_progress') return '<span class="status-icon" title="in progress">\\u25D0</span>';
+  return '<span class="status-icon" title="open">\\u25CB</span>';
+}
+
+function pbar(issues) {
+  const counts = {};
+  issues.forEach(i => { const p = i.priority ?? 2; counts[p] = (counts[p]||0)+1; });
+  const total = issues.length || 1;
+  let html = '<div class="pbar">';
+  [0,1,2,3,4].forEach(p => {
+    if (counts[p]) {
+      const pct = (counts[p]/total*100);
+      html += `<div style="width:${pct}%;background:${P_COLORS[p]}" title="P${p}: ${counts[p]}">${counts[p]>0&&pct>8?counts[p]:''}</div>`;
+    }
+  });
+  html += '</div>';
+  return html;
+}
+
+function setActive(id) {
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  const el = document.getElementById(id);
+  if (el) el.classList.add('active');
+}
+
+// --- Dashboard ---
+function showDashboard() {
+  setActive('nav-dashboard');
+  const main = document.getElementById('main-content');
+  const allIssues = DATA.repos.flatMap(r => r.issues);
+  const openCount = allIssues.filter(i => i.status !== 'closed').length;
+  const wipCount = allIssues.filter(i => i.status === 'in_progress').length;
+  const closedCount = allIssues.filter(i => i.status === 'closed').length;
+  const withBeads = DATA.repos.filter(r => r.issues.length > 0).length;
+
+  main.innerHTML = `
+    <div class="section-header"><h2>Dashboard</h2>
+      <span style="color:var(--fg3);font-size:13px">Generated ${new Date(DATA.generated_at).toLocaleString()}</span></div>
+    <div class="stats">
+      <div class="stat-card"><div class="label">Repositories</div><div class="value">${DATA.repos.length}</div>
+        <div class="sub">${withBeads} with beads tracking</div></div>
+      <div class="stat-card"><div class="label">Total Issues</div><div class="value">${allIssues.length}</div>
+        <div class="sub">${openCount} open, ${wipCount} in progress</div></div>
+      <div class="stat-card"><div class="label">Open</div><div class="value" style="color:var(--open)">${openCount}</div></div>
+      <div class="stat-card"><div class="label">In Progress</div><div class="value" style="color:var(--wip)">${wipCount}</div></div>
+      <div class="stat-card"><div class="label">Closed</div><div class="value" style="color:var(--closed)">${closedCount}</div></div>
+    </div>
+    <h3 style="margin-bottom:14px;font-size:14px;color:var(--fg3);text-transform:uppercase;letter-spacing:.5px">
+      Priority Distribution by Repository</h3>
+    <div id="prio-chart" style="margin-bottom:28px"></div>
+    <h3 style="margin-bottom:14px;font-size:14px;color:var(--fg3);text-transform:uppercase;letter-spacing:.5px">
+      Repositories</h3>
+    <div class="repo-grid" id="repo-grid"></div>
+  `;
+
+  // Priority chart
+  const chartEl = document.getElementById('prio-chart');
+  const maxIssues = Math.max(...DATA.repos.map(r => r.issues.length), 1);
+  DATA.repos.filter(r => r.issues.length > 0).sort((a,b) => b.issues.length - a.issues.length).forEach(repo => {
+    const row = document.createElement('div');
+    row.className = 'hbar';
+    row.style.cursor = 'pointer';
+    row.onclick = () => showRepo(repo.name);
+    row.innerHTML = `<div class="label">${repo.name}</div>
+      <div style="flex:1">${pbar(repo.issues)}</div>
+      <div class="count">${repo.issues.length}</div>`;
+    chartEl.appendChild(row);
+  });
+
+  // Repo cards
+  const grid = document.getElementById('repo-grid');
+  DATA.repos.forEach(repo => {
+    const openI = repo.issues.filter(i => i.status !== 'closed');
+    const card = document.createElement('div');
+    card.className = 'repo-card';
+    card.onclick = () => showRepo(repo.name);
+    if (repo.issues.length === 0) {
+      card.innerHTML = `<h3>${repo.name}</h3>
+        <div class="meta"><span>\\u{1F33F} ${repo.current_branch}</span>
+          <span>${repo.branch_count} branches</span>
+          ${repo.dirty ? '<span style="color:var(--open)">\\u25CF dirty</span>' : ''}</div>
+        <div class="no-beads">No beads tracking</div>`;
+    } else {
+      card.innerHTML = `<h3>${repo.name}
+          <span style="font-size:13px;color:var(--fg3);font-weight:400">${repo.issues.length} issues</span></h3>
+        <div class="meta"><span>\\u{1F33F} ${repo.current_branch}</span>
+          <span>${repo.branch_count} branches</span>
+          ${repo.dirty ? '<span style="color:var(--open)">\\u25CF dirty</span>' : ''}
+          ${repo.branches_with_beads > 0 ? '<span>'+repo.branches_with_beads+' w/ beads</span>' : ''}</div>
+        <div class="pbar-wrap">${pbar(repo.issues)}</div>
+        <div style="font-size:12px;color:var(--fg3);margin-top:8px">
+          ${openI.length} open \\u00B7
+          ${repo.issues.filter(i=>i.status==='in_progress').length} in progress \\u00B7
+          ${repo.issues.filter(i=>i.status==='closed').length} closed</div>`;
+    }
+    grid.appendChild(card);
+  });
+}
+
+// --- Repo detail ---
+function showRepo(name) {
+  setActive('nav-repo-' + name);
+  const repo = DATA.repos.find(r => r.name === name);
+  if (!repo) return;
+  activeFilters = {priority:null, type:null, status:null};
+  searchQuery = '';
+  currentSort = {col:null, asc:true};
+
+  const main = document.getElementById('main-content');
+  const types = [...new Set(repo.issues.map(i => i.issue_type || 'task'))].sort();
+  const labels = {};
+  repo.issues.forEach(i => (i.labels||[]).forEach(l => labels[l] = (labels[l]||0)+1));
+  const topLabels = Object.entries(labels).sort((a,b)=>b[1]-a[1]).slice(0,20);
+
+  main.innerHTML = `
+    <div class="section-header">
+      <h2>${repo.name}</h2>
+      <button class="back-btn" onclick="showDashboard()">\\u2190 Dashboard</button>
+    </div>
+    <div class="stats">
+      <div class="stat-card"><div class="label">Branch</div>
+        <div class="value" style="font-size:16px">${repo.current_branch}</div>
+        <div class="sub">${repo.dirty ? 'Uncommitted changes' : 'Clean'}</div></div>
+      <div class="stat-card"><div class="label">Branches</div>
+        <div class="value">${repo.branch_count}</div>
+        <div class="sub">${repo.branches_with_beads} with beads</div></div>
+      <div class="stat-card"><div class="label">Issues</div>
+        <div class="value">${repo.issues.length}</div></div>
+      <div class="stat-card"><div class="label">Open</div>
+        <div class="value" style="color:var(--open)">${repo.issues.filter(i=>i.status!=='closed').length}</div></div>
+      <div class="stat-card"><div class="label">In Progress</div>
+        <div class="value" style="color:var(--wip)">${repo.issues.filter(i=>i.status==='in_progress').length}</div></div>
+      <div class="stat-card"><div class="label">Closed</div>
+        <div class="value" style="color:var(--closed)">${repo.issues.filter(i=>i.status==='closed').length}</div></div>
+    </div>
+    ${repo.issues.length > 0 ? `
+    <div class="chart-section">
+      <div class="chart-card"><h3>By Priority</h3><div id="chart-prio"></div></div>
+      <div class="chart-card"><h3>By Type</h3><div id="chart-type"></div></div>
+    </div>
+    ${topLabels.length > 0 ? `<div class="chart-card" style="margin-bottom:20px">
+      <h3>Labels</h3><div id="label-cloud"></div></div>` : ''}
+    ${repo.differing_branches.length > 0 ? `<div class="chart-card" style="margin-bottom:20px">
+      <h3>Branches with different issue sets</h3><div id="diff-branches"></div></div>` : ''}
+    <div class="filters" id="filters-bar"></div>
+    <div class="issue-table-wrap"><table class="issues" id="issue-table"></table></div>
+    ` : '<div style="color:var(--fg3);font-style:italic;margin-top:20px">No beads tracking in this repository</div>'}
+  `;
+
+  if (repo.issues.length === 0) return;
+
+  // Priority chart
+  const prioEl = document.getElementById('chart-prio');
+  const maxP = Math.max(...Object.values(repo.issues.reduce((a,i) => {
+    const p = i.priority ?? 2; a[p]=(a[p]||0)+1; return a; }, {})));
+  [0,1,2,3,4].forEach(p => {
+    const c = repo.issues.filter(i => (i.priority??2) === p).length;
+    if (c === 0) return;
+    prioEl.innerHTML += `<div class="hbar"><div class="label">P${p}</div>
+      <div class="bar" style="width:${c/maxP*100}%;background:${P_COLORS[p]}">${c}</div></div>`;
+  });
+
+  // Type chart
+  const typeEl = document.getElementById('chart-type');
+  const typeCounts = {};
+  repo.issues.forEach(i => { const t = i.issue_type||'task'; typeCounts[t]=(typeCounts[t]||0)+1; });
+  const maxT = Math.max(...Object.values(typeCounts));
+  Object.entries(typeCounts).sort((a,b)=>b[1]-a[1]).forEach(([t,c]) => {
+    typeEl.innerHTML += `<div class="hbar"><div class="label">${t}</div>
+      <div class="bar" style="width:${c/maxT*100}%;background:${T_COLORS[t]||'#6b7280'}">${c}</div></div>`;
+  });
+
+  // Labels
+  if (topLabels.length > 0) {
+    const lcEl = document.getElementById('label-cloud');
+    topLabels.forEach(([l,c]) => {
+      lcEl.innerHTML += `<span class="badge-label" style="cursor:pointer;font-size:12px;padding:3px 8px;margin:2px"
+        onclick="filterByLabel('${l}')">${l} (${c})</span>`;
+    });
+  }
+
+  // Differing branches
+  if (repo.differing_branches.length > 0) {
+    const dbEl = document.getElementById('diff-branches');
+    repo.differing_branches.forEach(d => {
+      dbEl.innerHTML += `<div style="font-size:13px;color:var(--fg2);padding:4px 0">
+        ${d.branch} <span style="color:var(--fg3)">(${d.issue_lines} issue lines)</span></div>`;
+    });
+  }
+
+  // Filters
+  buildFilters(repo);
+  renderIssueTable(repo);
+}
+
+function buildFilters(repo) {
+  const bar = document.getElementById('filters-bar');
+  bar.innerHTML = '';
+  // Search
+  const search = document.createElement('input');
+  search.className = 'search';
+  search.placeholder = 'Search issues...';
+  search.value = searchQuery;
+  search.oninput = () => { searchQuery = search.value.toLowerCase(); renderIssueTable(repo); };
+  bar.appendChild(search);
+
+  // Priority filters
+  const pg = document.createElement('div');
+  pg.className = 'filter-group';
+  [0,1,2,3,4].forEach(p => {
+    const c = repo.issues.filter(i => (i.priority??2) === p).length;
+    if (c === 0) return;
+    const btn = document.createElement('button');
+    btn.className = 'filter-btn' + (activeFilters.priority === p ? ' active' : '');
+    btn.textContent = `P${p} (${c})`;
+    btn.style.borderColor = P_COLORS[p];
+    btn.onclick = () => { activeFilters.priority = activeFilters.priority===p ? null : p; renderIssueTable(repo); buildFilters(repo); };
+    pg.appendChild(btn);
+  });
+  bar.appendChild(pg);
+
+  // Type filters
+  const tg = document.createElement('div');
+  tg.className = 'filter-group';
+  const types = [...new Set(repo.issues.map(i => i.issue_type || 'task'))].sort();
+  types.forEach(t => {
+    const c = repo.issues.filter(i => (i.issue_type||'task') === t).length;
+    const btn = document.createElement('button');
+    btn.className = 'filter-btn' + (activeFilters.type === t ? ' active' : '');
+    btn.textContent = `${t} (${c})`;
+    btn.onclick = () => { activeFilters.type = activeFilters.type===t ? null : t; renderIssueTable(repo); buildFilters(repo); };
+    tg.appendChild(btn);
+  });
+  bar.appendChild(tg);
+
+  // Status filters
+  const sg = document.createElement('div');
+  sg.className = 'filter-group';
+  ['open','in_progress','closed'].forEach(s => {
+    const c = repo.issues.filter(i => (i.status||'open') === s).length;
+    if (c === 0) return;
+    const btn = document.createElement('button');
+    btn.className = 'filter-btn' + (activeFilters.status === s ? ' active' : '');
+    btn.textContent = `${s.replace('_',' ')} (${c})`;
+    btn.onclick = () => { activeFilters.status = activeFilters.status===s ? null : s; renderIssueTable(repo); buildFilters(repo); };
+    sg.appendChild(btn);
+  });
+  bar.appendChild(sg);
+}
+
+function filterByLabel(label) {
+  searchQuery = label;
+  const search = document.querySelector('.search');
+  if (search) search.value = label;
+  const repo = DATA.repos.find(r => document.querySelector('.nav-item.active')?.id === 'nav-repo-' + r.name);
+  if (repo) renderIssueTable(repo);
+}
+
+function renderIssueTable(repo) {
+  const table = document.getElementById('issue-table');
+  if (!table) return;
+
+  let issues = [...repo.issues];
+
+  // Filter
+  if (activeFilters.priority !== null) issues = issues.filter(i => (i.priority??2) === activeFilters.priority);
+  if (activeFilters.type) issues = issues.filter(i => (i.issue_type||'task') === activeFilters.type);
+  if (activeFilters.status) issues = issues.filter(i => (i.status||'open') === activeFilters.status);
+  if (searchQuery) issues = issues.filter(i =>
+    (i.title||'').toLowerCase().includes(searchQuery) ||
+    (i.id||'').toLowerCase().includes(searchQuery) ||
+    (i.labels||[]).some(l => l.toLowerCase().includes(searchQuery)) ||
+    (i.description||'').toLowerCase().includes(searchQuery)
+  );
+
+  // Sort
+  if (currentSort.col) {
+    issues.sort((a,b) => {
+      let va, vb;
+      switch(currentSort.col) {
+        case 'priority': va = a.priority??2; vb = b.priority??2; break;
+        case 'type': va = a.issue_type||'task'; vb = b.issue_type||'task'; break;
+        case 'status': va = a.status||'open'; vb = b.status||'open'; break;
+        case 'title': va = (a.title||'').toLowerCase(); vb = (b.title||'').toLowerCase(); break;
+        case 'id': va = a.id||''; vb = b.id||''; break;
+        default: return 0;
+      }
+      if (va < vb) return currentSort.asc ? -1 : 1;
+      if (va > vb) return currentSort.asc ? 1 : -1;
+      return 0;
+    });
+  } else {
+    issues.sort((a,b) => (a.priority??2) - (b.priority??2));
+  }
+
+  const cols = ['status','id','priority','type','title','labels','dependencies'];
+  const sortable = ['id','priority','type','status','title'];
+
+  let html = '<thead><tr>';
+  cols.forEach(c => {
+    const isSortable = sortable.includes(c);
+    const isSorted = currentSort.col === c;
+    const arrow = isSorted ? (currentSort.asc ? '\\u25B2' : '\\u25BC') : '\\u25B2';
+    html += `<th class="${isSorted?'sorted':''}" ${isSortable ? `onclick="sortBy('${c}','${repo.name}')"` : ''}>
+      ${c === 'dependencies' ? 'deps' : c}
+      ${isSortable ? `<span class="sort-arrow">${arrow}</span>` : ''}</th>`;
+  });
+  html += '</tr></thead><tbody>';
+
+  const issueMap = {};
+  repo.issues.forEach(i => issueMap[i.id] = i);
+
+  issues.forEach(i => {
+    const blockedBy = (i.blocked_by || []).filter(id => issueMap[id]);
+    const blocks = (i.blocks || []).filter(id => issueMap[id]);
+    const depsHtml = [
+      ...blockedBy.map(id => `<span style="color:var(--p0)">\\u2190 ${id}</span>`),
+      ...blocks.map(id => `<span style="color:var(--closed)">\\u2192 ${id}</span>`)
+    ].join(' ');
+
+    html += `<tr>
+      <td>${statusIcon(i.status||'open')}</td>
+      <td style="white-space:nowrap;font-family:monospace;font-size:12px">${i.id||''}</td>
+      <td>${priorityBadge(i.priority??2)}</td>
+      <td>${typeBadge(i.issue_type||'task')}</td>
+      <td class="title">${i.title||''}</td>
+      <td>${(i.labels||[]).map(l => `<span class="badge-label">${l}</span>`).join('')}</td>
+      <td class="deps">${depsHtml}</td>
+    </tr>`;
+  });
+
+  html += '</tbody>';
+  table.innerHTML = html;
+
+  // Count display
+  const countEl = document.querySelector('.filters .search');
+  if (countEl) countEl.placeholder = `Search ${issues.length} issues...`;
+}
+
+function sortBy(col, repoName) {
+  if (currentSort.col === col) currentSort.asc = !currentSort.asc;
+  else { currentSort.col = col; currentSort.asc = true; }
+  const repo = DATA.repos.find(r => r.name === repoName);
+  if (repo) renderIssueTable(repo);
+}
+
+// --- Sidebar nav ---
+function initNav() {
+  const navRepos = document.getElementById('nav-repos');
+  DATA.repos.forEach(r => {
+    const item = document.createElement('div');
+    item.className = 'nav-item';
+    item.id = 'nav-repo-' + r.name;
+    item.onclick = () => showRepo(r.name);
+    const dot = document.createElement('div');
+    dot.className = 'dot';
+    dot.style.background = r.issues.length > 0 ? '#22c55e' : '#475569';
+    item.appendChild(dot);
+    item.appendChild(document.createTextNode(r.name));
+    if (r.issues.length > 0) {
+      const badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.textContent = r.issues.filter(i=>i.status!=='closed').length || r.issues.length;
+      item.appendChild(badge);
+    }
+    navRepos.appendChild(item);
+  });
+}
+
+initNav();
+showDashboard();
+</script>
+</body>
+</html>'''
+
+with open(output_file, 'w') as f:
+    f.write(html)
+print(output_file)
+PYEOF
+
+    local report_path
+    report_path=$(python3 - "$output_file" "$@" << 'PYEOF'
+import sys, json, os, subprocess, datetime
+
+output_file = sys.argv[1]
+repo_dirs = sys.argv[2:]
+
+def run(cmd, cwd=None):
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=cwd, timeout=15)
+        return r.stdout.strip()
+    except:
+        return ""
+
+def parse_jsonl(text):
+    issues = []
+    for line in text.strip().split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            issues.append(json.loads(line))
+        except:
+            pass
+    return issues
+
+repos = []
+for repo_dir in repo_dirs:
+    repo_dir = repo_dir.rstrip('/')
+    name = os.path.basename(repo_dir)
+    current_branch = run("git symbolic-ref --short HEAD", cwd=repo_dir) or "(detached)"
+    status_out = run("git status --porcelain", cwd=repo_dir)
+    dirty = len(status_out) > 0
+    last_commit = run("git log -1 --format='%aI'", cwd=repo_dir)
+
+    branch_lines = run("git branch -a --no-color", cwd=repo_dir).split('\n')
+    branches = []
+    for b in branch_lines:
+        b = b.strip().lstrip('* ').strip()
+        if not b or 'HEAD' in b:
+            continue
+        branches.append(b)
+
+    branches_with_beads = []
+    for b in branches:
+        tree = run(f"git ls-tree --name-only '{b}' .beads/", cwd=repo_dir)
+        if tree:
+            branches_with_beads.append(b)
+
+    issues = []
+    jsonl_text = run(f"git show '{current_branch}:.beads/issues.jsonl'", cwd=repo_dir)
+    if not jsonl_text:
+        jsonl_path = os.path.join(repo_dir, '.beads', 'issues.jsonl')
+        if os.path.exists(jsonl_path):
+            with open(jsonl_path) as f:
+                jsonl_text = f.read()
+    if jsonl_text:
+        issues = parse_jsonl(jsonl_text)
+
+    current_hash = run(f"git rev-parse '{current_branch}:.beads/issues.jsonl'", cwd=repo_dir) or "none"
+    differing = []
+    for b in branches_with_beads:
+        if b == current_branch:
+            continue
+        bh = run(f"git rev-parse '{b}:.beads/issues.jsonl'", cwd=repo_dir) or "none"
+        if bh != current_hash:
+            lc = run(f"git show '{b}:.beads/issues.jsonl'", cwd=repo_dir).count('\n')
+            differing.append({"branch": b, "issue_lines": lc})
+
+    repos.append({
+        "name": name,
+        "path": repo_dir,
+        "current_branch": current_branch,
+        "dirty": dirty,
+        "last_commit": last_commit,
+        "branch_count": len(branches),
+        "branches_with_beads": len(branches_with_beads),
+        "differing_branches": differing,
+        "issues": issues,
+    })
+
+data = {
+    "generated_at": datetime.datetime.now().isoformat(),
+    "repos": repos,
+}
+
+# Read the template (first half), inject data, write complete file
+html_template = open(output_file).read() if os.path.exists(output_file) else ""
+
+# Actually just generate fresh - the template approach was from an earlier draft
+# The HTML is generated inline below
+html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Beads Audit Report</title>
+<style>
+:root {
+  --bg: #0f172a; --bg2: #1e293b; --bg3: #334155;
+  --fg: #f1f5f9; --fg2: #94a3b8; --fg3: #64748b;
+  --accent: #6366f1; --accent2: #818cf8;
+  --p0: #ef4444; --p1: #f97316; --p2: #3b82f6; --p3: #6b7280; --p4: #475569;
+  --open: #eab308; --wip: #3b82f6; --closed: #22c55e;
+  --epic: #a855f7; --task: #3b82f6; --bug: #ef4444; --feature: #22c55e;
+  --radius: 8px; --shadow: 0 4px 24px rgba(0,0,0,.4);
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  background: var(--bg); color: var(--fg); min-height: 100vh; }
+a { color: var(--accent2); text-decoration: none; }
+.app { display: flex; min-height: 100vh; }
+.sidebar { width: 260px; background: var(--bg2); border-right: 1px solid var(--bg3);
+  padding: 20px 0; flex-shrink: 0; position: fixed; top: 0; left: 0; bottom: 0;
+  overflow-y: auto; z-index: 10; }
+.main { margin-left: 260px; flex: 1; padding: 24px 32px; min-width: 0; }
+.sidebar h1 { font-size: 16px; padding: 0 20px 16px; color: var(--fg2);
+  border-bottom: 1px solid var(--bg3); margin-bottom: 12px; font-weight: 500; }
+.sidebar h1 span { color: var(--accent2); }
+.nav-item { display: flex; align-items: center; gap: 10px; padding: 10px 20px;
+  cursor: pointer; transition: background .15s; font-size: 14px; color: var(--fg2); }
+.nav-item:hover { background: var(--bg3); color: var(--fg); }
+.nav-item.active { background: var(--accent); color: white; font-weight: 500; }
+.nav-item .badge { margin-left: auto; background: var(--bg3); color: var(--fg2);
+  padding: 2px 8px; border-radius: 10px; font-size: 12px; font-weight: 500; }
+.nav-item.active .badge { background: rgba(255,255,255,.2); color: white; }
+.nav-item .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.nav-section { font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+  color: var(--fg3); padding: 16px 20px 6px; font-weight: 600; }
+.stats { display: flex; gap: 16px; margin-bottom: 28px; flex-wrap: wrap; }
+.stat-card { background: var(--bg2); border-radius: var(--radius); padding: 18px 22px;
+  flex: 1; min-width: 150px; border: 1px solid var(--bg3); }
+.stat-card .label { font-size: 12px; color: var(--fg3); text-transform: uppercase;
+  letter-spacing: .5px; margin-bottom: 6px; }
+.stat-card .value { font-size: 28px; font-weight: 700; }
+.stat-card .sub { font-size: 12px; color: var(--fg3); margin-top: 4px; }
+.pbar-wrap { margin: 6px 0; }
+.pbar { display: flex; height: 22px; border-radius: 4px; overflow: hidden; background: var(--bg3); }
+.pbar > div { transition: width .3s; display: flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: 600; color: white; min-width: 0; }
+.pbar > div:hover { filter: brightness(1.2); }
+.repo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
+.repo-card { background: var(--bg2); border-radius: var(--radius); padding: 20px;
+  border: 1px solid var(--bg3); cursor: pointer; transition: all .15s; }
+.repo-card:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: var(--shadow); }
+.repo-card h3 { font-size: 18px; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+.repo-card .meta { font-size: 13px; color: var(--fg3); margin-bottom: 12px; }
+.repo-card .meta span { margin-right: 14px; }
+.repo-card .no-beads { color: var(--fg3); font-style: italic; font-size: 13px; }
+.badge-p0,.badge-p1,.badge-p2,.badge-p3,.badge-p4 {
+  display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px;
+  font-weight: 600; color: white; }
+.badge-p0 { background: var(--p0); } .badge-p1 { background: var(--p1); }
+.badge-p2 { background: var(--p2); } .badge-p3 { background: var(--p3); }
+.badge-p4 { background: var(--p4); }
+.badge-type { display: inline-block; padding: 2px 8px; border-radius: 4px;
+  font-size: 11px; font-weight: 500; border: 1px solid; }
+.badge-epic { color: var(--epic); border-color: var(--epic); }
+.badge-task { color: var(--p2); border-color: var(--p2); }
+.badge-bug { color: var(--bug); border-color: var(--bug); }
+.badge-feature { color: var(--feature); border-color: var(--feature); }
+.badge-label { display: inline-block; padding: 1px 6px; border-radius: 3px;
+  font-size: 10px; background: var(--bg3); color: var(--fg2); margin: 1px; }
+.status-icon { display: inline-block; width: 16px; text-align: center; }
+.issue-table-wrap { overflow-x: auto; }
+table.issues { width: 100%%; border-collapse: collapse; font-size: 13px; }
+table.issues th { text-align: left; padding: 10px 12px; border-bottom: 2px solid var(--bg3);
+  color: var(--fg3); font-weight: 600; cursor: pointer; user-select: none;
+  white-space: nowrap; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+table.issues th:hover { color: var(--fg); }
+table.issues th .sort-arrow { margin-left: 4px; opacity: .4; }
+table.issues th.sorted .sort-arrow { opacity: 1; color: var(--accent2); }
+table.issues td { padding: 10px 12px; border-bottom: 1px solid var(--bg3); vertical-align: top; }
+table.issues tr:hover { background: rgba(99,102,241,.06); }
+table.issues .title { max-width: 400px; }
+table.issues .deps { font-size: 11px; color: var(--fg3); }
+.filters { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }
+.search { background: var(--bg2); border: 1px solid var(--bg3); border-radius: var(--radius);
+  padding: 8px 14px; color: var(--fg); font-size: 14px; width: 260px; outline: none; }
+.search:focus { border-color: var(--accent); }
+.filter-group { display: flex; gap: 4px; flex-wrap: wrap; }
+.filter-btn { background: var(--bg2); border: 1px solid var(--bg3); border-radius: 4px;
+  padding: 5px 10px; color: var(--fg2); font-size: 12px; cursor: pointer; transition: all .1s; }
+.filter-btn:hover { border-color: var(--fg3); color: var(--fg); }
+.filter-btn.active { background: var(--accent); border-color: var(--accent); color: white; }
+.section-header { display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 18px; }
+.section-header h2 { font-size: 22px; font-weight: 600; }
+.back-btn { background: var(--bg2); border: 1px solid var(--bg3); border-radius: var(--radius);
+  padding: 7px 16px; color: var(--fg2); cursor: pointer; font-size: 13px; transition: all .1s; }
+.back-btn:hover { border-color: var(--accent); color: var(--fg); }
+.chart-section { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
+.chart-card { background: var(--bg2); border-radius: var(--radius); padding: 18px;
+  border: 1px solid var(--bg3); }
+.chart-card h3 { font-size: 13px; color: var(--fg3); margin-bottom: 14px; text-transform: uppercase;
+  letter-spacing: .5px; font-weight: 600; }
+.hbar { display: flex; align-items: center; margin: 6px 0; }
+.hbar .label { width: 70px; font-size: 12px; color: var(--fg2); flex-shrink: 0; }
+.hbar .bar { height: 20px; border-radius: 3px; transition: width .3s; min-width: 2px;
+  display: flex; align-items: center; padding-left: 6px; font-size: 11px; font-weight: 600; color: white; }
+.hbar .count { margin-left: 8px; font-size: 12px; color: var(--fg3); flex-shrink: 0; }
+@media (max-width: 900px) {
+  .sidebar { display: none; }
+  .main { margin-left: 0; padding: 16px; }
+  .chart-section { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <nav class="sidebar">
+    <h1><span>&#x25C9;</span> Beads Audit</h1>
+    <div class="nav-item active" onclick="showDashboard()" id="nav-dashboard">Dashboard</div>
+    <div class="nav-section">Repositories</div>
+    <div id="nav-repos"></div>
+  </nav>
+  <main class="main" id="main-content"></main>
+</div>
+<script>
+const DATA = %s;
+const P_COLORS = {0:'#ef4444',1:'#f97316',2:'#3b82f6',3:'#6b7280',4:'#475569'};
+const T_COLORS = {epic:'#a855f7',task:'#3b82f6',bug:'#ef4444',feature:'#22c55e'};
+let currentSort = {col:null, asc:true};
+let activeFilters = {priority:null, type:null, status:null};
+let searchQuery = '';
+
+function priorityBadge(p) { return '<span class="badge-p'+p+'">P'+p+'</span>'; }
+function typeBadge(t) {
+  const cls = T_COLORS[t] ? t : 'task';
+  return '<span class="badge-type badge-'+cls+'">'+(t||'task')+'</span>';
+}
+function statusIcon(s) {
+  if (s==='closed') return '<span class="status-icon" title="closed">\\u2713</span>';
+  if (s==='in_progress') return '<span class="status-icon" title="in progress">\\u25D0</span>';
+  return '<span class="status-icon" title="open">\\u25CB</span>';
+}
+function pbar(issues) {
+  const counts = {};
+  issues.forEach(i => { const p=i.priority??2; counts[p]=(counts[p]||0)+1; });
+  const total = issues.length||1;
+  let h = '<div class="pbar">';
+  [0,1,2,3,4].forEach(p => {
+    if (counts[p]) {
+      const pct=counts[p]/total*100;
+      h += '<div style="width:'+pct+'%%;background:'+P_COLORS[p]+'" title="P'+p+': '+counts[p]+'">'+(counts[p]>0&&pct>8?counts[p]:'')+'</div>';
+    }
+  });
+  return h+'</div>';
+}
+function setActive(id) {
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+  const el=document.getElementById(id); if(el) el.classList.add('active');
+}
+
+function showDashboard() {
+  setActive('nav-dashboard');
+  const main=document.getElementById('main-content');
+  const all=DATA.repos.flatMap(r=>r.issues);
+  const openC=all.filter(i=>i.status!=='closed').length;
+  const wipC=all.filter(i=>i.status==='in_progress').length;
+  const closedC=all.filter(i=>i.status==='closed').length;
+  const withB=DATA.repos.filter(r=>r.issues.length>0).length;
+  main.innerHTML = '<div class="section-header"><h2>Dashboard</h2><span style="color:var(--fg3);font-size:13px">Generated '+new Date(DATA.generated_at).toLocaleString()+'</span></div>'+
+    '<div class="stats">'+
+    '<div class="stat-card"><div class="label">Repositories</div><div class="value">'+DATA.repos.length+'</div><div class="sub">'+withB+' with beads</div></div>'+
+    '<div class="stat-card"><div class="label">Total Issues</div><div class="value">'+all.length+'</div><div class="sub">'+openC+' open, '+wipC+' in progress</div></div>'+
+    '<div class="stat-card"><div class="label">Open</div><div class="value" style="color:var(--open)">'+openC+'</div></div>'+
+    '<div class="stat-card"><div class="label">In Progress</div><div class="value" style="color:var(--wip)">'+wipC+'</div></div>'+
+    '<div class="stat-card"><div class="label">Closed</div><div class="value" style="color:var(--closed)">'+closedC+'</div></div></div>'+
+    '<h3 style="margin-bottom:14px;font-size:14px;color:var(--fg3);text-transform:uppercase;letter-spacing:.5px">Priority Distribution</h3>'+
+    '<div id="prio-chart" style="margin-bottom:28px"></div>'+
+    '<h3 style="margin-bottom:14px;font-size:14px;color:var(--fg3);text-transform:uppercase;letter-spacing:.5px">Repositories</h3>'+
+    '<div class="repo-grid" id="repo-grid"></div>';
+  const ch=document.getElementById('prio-chart');
+  DATA.repos.filter(r=>r.issues.length>0).sort((a,b)=>b.issues.length-a.issues.length).forEach(r=>{
+    const row=document.createElement('div'); row.className='hbar'; row.style.cursor='pointer';
+    row.onclick=()=>showRepo(r.name);
+    row.innerHTML='<div class="label">'+r.name+'</div><div style="flex:1">'+pbar(r.issues)+'</div><div class="count">'+r.issues.length+'</div>';
+    ch.appendChild(row);
+  });
+  const grid=document.getElementById('repo-grid');
+  DATA.repos.forEach(r=>{
+    const card=document.createElement('div'); card.className='repo-card';
+    card.onclick=()=>showRepo(r.name);
+    if(r.issues.length===0){
+      card.innerHTML='<h3>'+r.name+'</h3><div class="meta"><span>\\u{1f33f} '+r.current_branch+'</span><span>'+r.branch_count+' branches</span>'+(r.dirty?'<span style="color:var(--open)">\\u25cf dirty</span>':'')+'</div><div class="no-beads">No beads tracking</div>';
+    } else {
+      card.innerHTML='<h3>'+r.name+' <span style="font-size:13px;color:var(--fg3);font-weight:400">'+r.issues.length+' issues</span></h3><div class="meta"><span>\\u{1f33f} '+r.current_branch+'</span><span>'+r.branch_count+' branches</span>'+(r.dirty?'<span style="color:var(--open)">\\u25cf dirty</span>':'')+'</div><div class="pbar-wrap">'+pbar(r.issues)+'</div><div style="font-size:12px;color:var(--fg3);margin-top:8px">'+r.issues.filter(i=>i.status!=='closed').length+' open \\u00b7 '+r.issues.filter(i=>i.status==='in_progress').length+' in progress \\u00b7 '+r.issues.filter(i=>i.status==='closed').length+' closed</div>';
+    }
+    grid.appendChild(card);
+  });
+}
+
+function showRepo(name) {
+  setActive('nav-repo-'+name);
+  const repo=DATA.repos.find(r=>r.name===name); if(!repo) return;
+  activeFilters={priority:null,type:null,status:null}; searchQuery=''; currentSort={col:null,asc:true};
+  const main=document.getElementById('main-content');
+  const labels={}; repo.issues.forEach(i=>(i.labels||[]).forEach(l=>{labels[l]=(labels[l]||0)+1}));
+  const topL=Object.entries(labels).sort((a,b)=>b[1]-a[1]).slice(0,20);
+  let ih='<div class="section-header"><h2>'+repo.name+'</h2><button class="back-btn" onclick="showDashboard()">\\u2190 Dashboard</button></div>'+
+    '<div class="stats">'+
+    '<div class="stat-card"><div class="label">Branch</div><div class="value" style="font-size:16px">'+repo.current_branch+'</div><div class="sub">'+(repo.dirty?'Uncommitted changes':'Clean')+'</div></div>'+
+    '<div class="stat-card"><div class="label">Branches</div><div class="value">'+repo.branch_count+'</div><div class="sub">'+repo.branches_with_beads+' with beads</div></div>'+
+    '<div class="stat-card"><div class="label">Issues</div><div class="value">'+repo.issues.length+'</div></div>'+
+    '<div class="stat-card"><div class="label">Open</div><div class="value" style="color:var(--open)">'+repo.issues.filter(i=>i.status!=='closed').length+'</div></div>'+
+    '<div class="stat-card"><div class="label">In Progress</div><div class="value" style="color:var(--wip)">'+repo.issues.filter(i=>i.status==='in_progress').length+'</div></div>'+
+    '<div class="stat-card"><div class="label">Closed</div><div class="value" style="color:var(--closed)">'+repo.issues.filter(i=>i.status==='closed').length+'</div></div></div>';
+  if(repo.issues.length>0){
+    ih+='<div class="chart-section"><div class="chart-card"><h3>By Priority</h3><div id="chart-prio"></div></div><div class="chart-card"><h3>By Type</h3><div id="chart-type"></div></div></div>';
+    if(topL.length>0) ih+='<div class="chart-card" style="margin-bottom:20px"><h3>Labels</h3><div id="label-cloud"></div></div>';
+    if(repo.differing_branches.length>0) ih+='<div class="chart-card" style="margin-bottom:20px"><h3>Branches with different issue sets</h3><div id="diff-branches"></div></div>';
+    ih+='<div class="filters" id="filters-bar"></div><div class="issue-table-wrap"><table class="issues" id="issue-table"></table></div>';
+  } else {
+    ih+='<div style="color:var(--fg3);font-style:italic;margin-top:20px">No beads tracking in this repository</div>';
+  }
+  main.innerHTML=ih;
+  if(repo.issues.length===0) return;
+  const prioEl=document.getElementById('chart-prio');
+  const pc={}; repo.issues.forEach(i=>{const p=i.priority??2;pc[p]=(pc[p]||0)+1});
+  const mp=Math.max(...Object.values(pc));
+  [0,1,2,3,4].forEach(p=>{const c=pc[p]||0;if(!c)return;prioEl.innerHTML+='<div class="hbar"><div class="label">P'+p+'</div><div class="bar" style="width:'+c/mp*100+'%%;background:'+P_COLORS[p]+'">'+c+'</div></div>';});
+  const typeEl=document.getElementById('chart-type');
+  const tc={}; repo.issues.forEach(i=>{const t=i.issue_type||'task';tc[t]=(tc[t]||0)+1});
+  const mt=Math.max(...Object.values(tc));
+  Object.entries(tc).sort((a,b)=>b[1]-a[1]).forEach(([t,c])=>{typeEl.innerHTML+='<div class="hbar"><div class="label">'+t+'</div><div class="bar" style="width:'+c/mt*100+'%%;background:'+(T_COLORS[t]||'#6b7280')+'">'+c+'</div></div>';});
+  if(topL.length>0){const lc=document.getElementById('label-cloud');topL.forEach(([l,c])=>{lc.innerHTML+='<span class="badge-label" style="cursor:pointer;font-size:12px;padding:3px 8px;margin:2px" onclick="filterByLabel(\\''+l+'\\')">'+l+' ('+c+')</span>';});}
+  if(repo.differing_branches.length>0){const db=document.getElementById('diff-branches');repo.differing_branches.forEach(d=>{db.innerHTML+='<div style="font-size:13px;color:var(--fg2);padding:4px 0">'+d.branch+' <span style="color:var(--fg3)">('+d.issue_lines+' lines)</span></div>';});}
+  buildFilters(repo);
+  renderIssueTable(repo);
+}
+
+function buildFilters(repo) {
+  const bar=document.getElementById('filters-bar'); bar.innerHTML='';
+  const s=document.createElement('input'); s.className='search'; s.placeholder='Search issues...'; s.value=searchQuery;
+  s.oninput=()=>{searchQuery=s.value.toLowerCase();renderIssueTable(repo);}; bar.appendChild(s);
+  const pg=document.createElement('div');pg.className='filter-group';
+  [0,1,2,3,4].forEach(p=>{const c=repo.issues.filter(i=>(i.priority??2)===p).length;if(!c)return;const b=document.createElement('button');b.className='filter-btn'+(activeFilters.priority===p?' active':'');b.textContent='P'+p+' ('+c+')';b.style.borderColor=P_COLORS[p];b.onclick=()=>{activeFilters.priority=activeFilters.priority===p?null:p;renderIssueTable(repo);buildFilters(repo);};pg.appendChild(b);});
+  bar.appendChild(pg);
+  const tg=document.createElement('div');tg.className='filter-group';
+  [...new Set(repo.issues.map(i=>i.issue_type||'task'))].sort().forEach(t=>{const c=repo.issues.filter(i=>(i.issue_type||'task')===t).length;const b=document.createElement('button');b.className='filter-btn'+(activeFilters.type===t?' active':'');b.textContent=t+' ('+c+')';b.onclick=()=>{activeFilters.type=activeFilters.type===t?null:t;renderIssueTable(repo);buildFilters(repo);};tg.appendChild(b);});
+  bar.appendChild(tg);
+  const sg=document.createElement('div');sg.className='filter-group';
+  ['open','in_progress','closed'].forEach(st=>{const c=repo.issues.filter(i=>(i.status||'open')===st).length;if(!c)return;const b=document.createElement('button');b.className='filter-btn'+(activeFilters.status===st?' active':'');b.textContent=st.replace('_',' ')+' ('+c+')';b.onclick=()=>{activeFilters.status=activeFilters.status===st?null:st;renderIssueTable(repo);buildFilters(repo);};sg.appendChild(b);});
+  bar.appendChild(sg);
+}
+
+function filterByLabel(l){searchQuery=l;const s=document.querySelector('.search');if(s)s.value=l;const repo=DATA.repos.find(r=>document.querySelector('.nav-item.active')?.id==='nav-repo-'+r.name);if(repo)renderIssueTable(repo);}
+
+function renderIssueTable(repo) {
+  const table=document.getElementById('issue-table'); if(!table)return;
+  let issues=[...repo.issues];
+  if(activeFilters.priority!==null)issues=issues.filter(i=>(i.priority??2)===activeFilters.priority);
+  if(activeFilters.type)issues=issues.filter(i=>(i.issue_type||'task')===activeFilters.type);
+  if(activeFilters.status)issues=issues.filter(i=>(i.status||'open')===activeFilters.status);
+  if(searchQuery)issues=issues.filter(i=>(i.title||'').toLowerCase().includes(searchQuery)||(i.id||'').toLowerCase().includes(searchQuery)||(i.labels||[]).some(l=>l.toLowerCase().includes(searchQuery))||(i.description||'').toLowerCase().includes(searchQuery));
+  if(currentSort.col){issues.sort((a,b)=>{let va,vb;switch(currentSort.col){case'priority':va=a.priority??2;vb=b.priority??2;break;case'type':va=a.issue_type||'task';vb=b.issue_type||'task';break;case'status':va=a.status||'open';vb=b.status||'open';break;case'title':va=(a.title||'').toLowerCase();vb=(b.title||'').toLowerCase();break;case'id':va=a.id||'';vb=b.id||'';break;default:return 0;}if(va<vb)return currentSort.asc?-1:1;if(va>vb)return currentSort.asc?1:-1;return 0;});}
+  else{issues.sort((a,b)=>(a.priority??2)-(b.priority??2));}
+  const cols=['status','id','priority','type','title','labels','deps'];
+  const sortable=['id','priority','type','status','title'];
+  let h='<thead><tr>';
+  cols.forEach(c=>{const is=sortable.includes(c);const isd=currentSort.col===c;const ar=isd?(currentSort.asc?'\\u25b2':'\\u25bc'):'\\u25b2';h+='<th class="'+(isd?'sorted':'')+'" '+(is?'onclick="sortBy(\\''+c+'\\',\\''+repo.name+'\\')'+'"':'')+'>'+c+(is?'<span class="sort-arrow">'+ar+'</span>':'')+'</th>';});
+  h+='</tr></thead><tbody>';
+  const im={};repo.issues.forEach(i=>im[i.id]=i);
+  issues.forEach(i=>{
+    const bb=(i.blocked_by||[]).filter(id=>im[id]);
+    const bl=(i.blocks||[]).filter(id=>im[id]);
+    const dh=[...bb.map(id=>'<span style="color:var(--p0)">\\u2190 '+id+'</span>'),...bl.map(id=>'<span style="color:var(--closed)">\\u2192 '+id+'</span>')].join(' ');
+    h+='<tr><td>'+statusIcon(i.status||'open')+'</td><td style="white-space:nowrap;font-family:monospace;font-size:12px">'+(i.id||'')+'</td><td>'+priorityBadge(i.priority??2)+'</td><td>'+typeBadge(i.issue_type||'task')+'</td><td class="title">'+(i.title||'')+'</td><td>'+(i.labels||[]).map(l=>'<span class="badge-label">'+l+'</span>').join('')+'</td><td class="deps">'+dh+'</td></tr>';
+  });
+  table.innerHTML=h+'</tbody>';
+}
+
+function sortBy(col,rn){if(currentSort.col===col)currentSort.asc=!currentSort.asc;else{currentSort.col=col;currentSort.asc=true;}const r=DATA.repos.find(r=>r.name===rn);if(r)renderIssueTable(r);}
+
+function initNav(){const nr=document.getElementById('nav-repos');DATA.repos.forEach(r=>{const it=document.createElement('div');it.className='nav-item';it.id='nav-repo-'+r.name;it.onclick=()=>showRepo(r.name);const d=document.createElement('div');d.className='dot';d.style.background=r.issues.length>0?'#22c55e':'#475569';it.appendChild(d);it.appendChild(document.createTextNode(r.name));if(r.issues.length>0){const b=document.createElement('span');b.className='badge';b.textContent=r.issues.filter(i=>i.status!=='closed').length||r.issues.length;it.appendChild(b);}nr.appendChild(it);});}
+initNav();showDashboard();
+</script>
+</body>
+</html>""" %% json.dumps(data)
+
+with open(output_file, 'w') as f:
+    f.write(html)
+print(output_file)
+PYEOF
+    )
+
+    if [[ -f "$report_path" ]]; then
+        echo -e "${BOLD}${GREEN}Report saved to: ${report_path}${RESET}"
+        xdg-open "$report_path" 2>/dev/null &
+    else
+        echo -e "${RED}Failed to generate report${RESET}" >&2
+        exit 1
+    fi
+}
+
+# --- Entry point ---
+
+main() {
+    local count="$DEFAULT_COUNT"
+    local single_repo=""
+    local web_mode=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --repo)
+                single_repo="$2"
+                shift 2
+                ;;
+            --web|--html)
+                web_mode=true
+                shift
+                ;;
+            --help|-h)
+                echo "Usage: audit-repo-beads [N]"
+                echo "       audit-repo-beads --repo <path>"
+                echo "       audit-repo-beads --web [N]"
+                echo ""
+                echo "Audits the N most recently committed repos in ~/src for beads issues"
+                echo "across all branches. Uses git ls-tree to check branches without checkout"
+                echo "and temporary worktrees when needed."
+                echo ""
+                echo "Options:"
+                echo "  --web, --html    Generate interactive HTML report and open in browser"
+                echo "  --repo <path>    Audit a single repo"
+                echo "  N                Number of repos to audit (default: 10)"
+                exit 0
+                ;;
+            [0-9]*)
+                count="$1"
+                shift
+                ;;
+            *)
+                echo "Unknown argument: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    # Collect repo list
+    local repo_list=()
+    if [[ -n "$single_repo" ]]; then
+        repo_list+=("$single_repo")
+    else
+        while IFS= read -r repo; do
+            [[ -z "$repo" ]] && continue
+            repo_list+=("${repo%/}")
+        done < <(get_recent_repos "$count")
+    fi
+
+    if [[ "$web_mode" == "true" ]]; then
+        generate_web_report "${repo_list[@]}"
+    else
+        if [[ -n "$single_repo" ]]; then
+            audit_repo "$single_repo"
+        else
+            echo -e "${BOLD}Auditing top $count most recently committed repos in $SRC_DIR${RESET}"
+            echo -e "Date: $(date -Iseconds)\n"
+            for repo in "${repo_list[@]}"; do
+                audit_repo "$repo"
+            done
+        fi
+        echo -e "\n${BOLD}${GREEN}Audit complete.${RESET}"
+    fi
+}
+
+main "$@"

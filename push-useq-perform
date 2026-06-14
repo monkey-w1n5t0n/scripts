@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+
+cd ~/src/useq-perform && \
+  rsync -avz --delete \
+    --exclude=node_modules \
+    --exclude=.git public/ \
+    w1n5t0n@lnfinitemonkeys.org:src/useq-perform/public/

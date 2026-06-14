@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Check which fork repos in ~/src need syncing with upstream
+
+SRC_DIR="$HOME/src"
+GT_IGNORE="$HOME/src/.gt-ignore"
+
+for repo_dir in "$SRC_DIR"/*; do
+	[[ ! -d "$repo_dir" ]] && continue
+	[[ ! -d "$repo_dir/.git" ]] && continue
+
+	repo_name=$(basename "$repo_dir")
+	repo_full_name=$(cd "$repo_dir" && git remote get-url origin 2>/dev/null | sed -E 's|.*[:/]([^/]+/[^/]+)\.git$|\1|' || echo "")
+
+	# Skip if in ignore list
+	if [[ -f "$GT_IGNORE" ]]; then
+		if grep -qx "$repo_name" "$GT_IGNORE" || grep -qx "$repo_full_name" "$GT_IGNORE"; then
+			continue
+		fi
+	fi
+
+	cd "$repo_dir" || continue
+
+	# Only process forks
+	has_upstream=false
+	is_fork=false
+
+	if git remote | grep -q "upstream"; then
+		has_upstream=true
+	fi
+
+	if [[ -n "$repo_full_name" ]]; then
+		if gh repo view "$repo_full_name" --json isFork --jq '.isFork' 2>/dev/null | grep -q "true"; then
+			is_fork=true
+		fi
+	fi
+
+	if [[ "$has_upstream" == "true" ]] || [[ "$is_fork" == "true" ]]; then
+		# Fetch upstream to check for updates
+		git fetch upstream >/dev/null 2>&1
+
+		# Get the default branch
+		default_branch=$(git rev-parse --abbrev-ref upstream/HEAD 2>/dev/null | sed 's|upstream/||')
+
+		if [[ -z "$default_branch" ]]; then
+			default_branch=$(git symbolic-ref refs/remotes/upstream/HEAD 2>/dev/null | sed 's|refs/remotes/upstream/||')
+		fi
+
+		if [[ -n "$default_branch" ]]; then
+			# Check if upstream/default_branch is ahead of local/default_branch
+			behind_count=$(git rev-list --left-right --count "upstream/$default_branch...HEAD" 2>/dev/null | awk '{print $1}')
+
+			if [[ "$behind_count" -gt 0 ]]; then
+				echo "$repo_name"
+			fi
+		fi
+	fi
+done

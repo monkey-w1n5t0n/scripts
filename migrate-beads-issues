@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""
+Migrate issues from beads_src (Dolt) to their correct destination repos.
+Handles both Dolt and SQLite backends. Also migrates dependencies.
+Usage: migrate-beads-issues [--dry-run]
+"""
+
+import json, sqlite3, subprocess, sys, xml.etree.ElementTree as ET
+from pathlib import Path
+from collections import defaultdict
+
+DRY_RUN = "--dry-run" in sys.argv
+
+MIGRATIONS_FILE = Path("/tmp/confirmed_migrations.json")
+if not MIGRATIONS_FILE.exists():
+    print("ERROR: /tmp/confirmed_migrations.json not found", file=sys.stderr)
+    sys.exit(1)
+
+with open(MIGRATIONS_FILE) as f:
+    assignments = json.load(f)   # repo -> [issue_id, ...]
+
+# Flatten to id -> repo
+id_to_repo = {}
+for repo, ids in assignments.items():
+    for iid in ids:
+        id_to_repo[iid] = repo
+
+# ── repo info ──────────────────────────────────────────────────────────────────
+
+REPO_INFO = {}
+search_roots = [Path.home() / "src", Path.home() / "src/00_misc"]
+for repo in assignments:
+    for root in search_roots:
+        p = root / repo
+        if p.exists() and (p / ".beads").exists():
+            meta = json.loads((p / ".beads/metadata.json").read_text())
+            backend = meta.get("dolt_database") or meta.get("database", "beads.db")
+            REPO_INFO[repo] = {
+                "path": p,
+                "backend": "dolt" if meta.get("dolt_database") else "sqlite",
+                "db": backend,
+                "db_path": p / ".beads/beads.db" if meta.get("database") == "beads.db" else None,
+                "jsonl_path": p / ".beads/issues.jsonl",
+            }
+            break
+    if repo not in REPO_INFO:
+        print(f"WARNING: repo {repo} not found on disk, skipping", file=sys.stderr)
+
+# ── fetch source data from beads_src ──────────────────────────────────────────
+
+_sql_tmp = Path("/tmp/_beads_migrate_query.sql")
+
+def mysql(query, db="beads_src"):
+    _sql_tmp.write_text(query)
+    r = subprocess.run(
+        ["nix-shell", "-p", "mariadb", "--run",
+         f"mariadb -h 127.0.0.1 -P 3307 -u root {db} --xml 2>/dev/null < {_sql_tmp}"],
+        capture_output=True, text=True
+    )
+    xml = r.stdout.strip()
+    if not xml or "<row>" not in xml:
+        return []
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        try:
+            root = ET.fromstring(f"<root>{xml}</root>")
+        except ET.ParseError:
+            return []
+    rows = []
+    for row in root.findall(".//row"):
+        d = {}
+        for f in row:
+            if f.text is not None:
+                d[f.get("name")] = f.text
+        rows.append(d)
+    return rows
+
+def mysql_exec(sql, db="beads_src"):
+    subprocess.run(
+        ["nix-shell", "-p", "mariadb", "--run",
+         f"mariadb -h 127.0.0.1 -P 3307 -u root {db} -e {json.dumps(sql)} 2>/dev/null"],
+        capture_output=True
+    )
+
+ids_quoted = ", ".join(f"'{i}'" for i in id_to_repo)
+all_issues = mysql(f"SELECT * FROM issues WHERE id IN ({ids_quoted})")
+all_deps   = mysql(f"""
+    SELECT * FROM dependencies
+    WHERE issue_id IN ({ids_quoted})
+       OR depends_on_id IN ({ids_quoted})
+""")
+
+print(f"Found {len(all_issues)} issues, {len(all_deps)} dependencies in beads_src")
+
+issue_map = {r["id"]: r for r in all_issues}
+
+# ── insert helpers ─────────────────────────────────────────────────────────────
+
+CORE_COLS = ["id","title","description","design","acceptance_criteria","notes",
+             "status","priority","issue_type","assignee","created_at","created_by",
+             "owner","updated_at","closed_at","close_reason","source_repo",
+             "estimated_minutes","due_at","defer_until","wisp_type","mol_type",
+             "work_type","pinned","is_template","quality_score"]
+
+DEP_COLS = ["issue_id","depends_on_id","type","created_at","created_by","metadata"]
+
+def esc_sql(v):
+    if v is None: return "NULL"
+    return "'" + str(v).replace("\\","\\\\").replace("'","\\'").replace("\n","\\n").replace("\r","\\r") + "'"
+
+def insert_dolt(db_name, issues, deps):
+    stmts = [f"USE {db_name};"]
+    for row in issues:
+        cols, vals = [], []
+        for c in CORE_COLS:
+            v = row.get(c)
+            if v is not None:
+                cols.append(c); vals.append(esc_sql(v))
+        stmts.append(f"INSERT IGNORE INTO issues ({','.join(cols)}) VALUES ({','.join(vals)});")
+    for d in deps:
+        cols, vals = [], []
+        for c in DEP_COLS:
+            v = d.get(c)
+            if v is not None:
+                cols.append(c); vals.append(esc_sql(v))
+        if cols:
+            stmts.append(f"INSERT IGNORE INTO dependencies ({','.join(cols)}) VALUES ({','.join(vals)});")
+    sql = "\n".join(stmts)
+    if DRY_RUN:
+        print(f"  [DRY RUN] Would insert {len(issues)} issues + {len(deps)} deps into {db_name}")
+        return
+    tf = Path(f"/tmp/migrate_{db_name}.sql")
+    tf.write_text(sql)
+    subprocess.run(["nix-shell","-p","mariadb","--run",
+                    f"mariadb -h 127.0.0.1 -P 3307 -u root < {tf} 2>/dev/null"])
+    print(f"  → inserted {len(issues)} issues + {len(deps)} deps into {db_name}")
+
+def insert_sqlite(db_path, issues, deps):
+    if DRY_RUN:
+        print(f"  [DRY RUN] Would insert {len(issues)} issues + {len(deps)} deps into {db_path.name}")
+        return
+    con = sqlite3.connect(str(db_path))
+    cur = con.cursor()
+    # Get actual columns in the sqlite issues table
+    sqlite_cols = {r[1] for r in cur.execute("PRAGMA table_info(issues)").fetchall()}
+    dep_cols_sqlite = {r[1] for r in cur.execute("PRAGMA table_info(dependencies)").fetchall()}
+
+    for row in issues:
+        cols = [c for c in CORE_COLS if c in sqlite_cols and row.get(c) is not None]
+        vals = [row[c] for c in cols]
+        placeholders = ",".join("?" * len(cols))
+        try:
+            cur.execute(f"INSERT OR IGNORE INTO issues ({','.join(cols)}) VALUES ({placeholders})", vals)
+        except Exception as e:
+            print(f"    WARN: {row['id']}: {e}")
+
+    for d in deps:
+        cols = [c for c in DEP_COLS if c in dep_cols_sqlite and d.get(c) is not None]
+        vals = [d[c] for c in cols]
+        placeholders = ",".join("?" * len(cols))
+        try:
+            cur.execute(f"INSERT OR IGNORE INTO dependencies ({','.join(cols)}) VALUES ({placeholders})", vals)
+        except Exception as e:
+            print(f"    WARN dep: {e}")
+
+    con.commit(); con.close()
+    print(f"  → inserted {len(issues)} issues + {len(deps)} deps into {db_path.name}")
+
+# ── regenerate JSONL ──────────────────────────────────────────────────────────
+
+def regen_jsonl_dolt(db_name, jsonl_path):
+    r = subprocess.run(
+        ["nix-shell","-p","mariadb","--run",
+         f"mariadb -h 127.0.0.1 -P 3307 -u root {db_name} --xml -e 'SELECT id,title,description,status,priority,issue_type,created_by,owner,created_at,updated_at,closed_at,close_reason,notes,design FROM issues ORDER BY created_at;' 2>/dev/null"],
+        capture_output=True, text=True
+    )
+    if not r.stdout.strip():
+        return 0
+    root = ET.fromstring(r.stdout)
+    issues = []
+    for row in root.findall(".//row"):
+        issue = {}
+        for f in row:
+            v = f.text
+            if v is None: continue
+            if f.get("name") == "priority":
+                issue["priority"] = int(v)
+            elif f.get("name") in ("created_at","updated_at","closed_at"):
+                issue[f.get("name")] = v.replace(" ","T")+"Z"
+            elif v:
+                issue[f.get("name")] = v
+        issues.append(issue)
+    jsonl_path.write_text("\n".join(json.dumps(i) for i in issues) + "\n")
+    return len(issues)
+
+def regen_jsonl_sqlite(db_path, jsonl_path):
+    con = sqlite3.connect(str(db_path))
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        "SELECT id,title,description,status,priority,issue_type,created_by,owner,"
+        "created_at,updated_at,closed_at,close_reason,notes,design "
+        "FROM issues WHERE deleted_at IS NULL ORDER BY created_at"
+    ).fetchall()
+    con.close()
+    issues = []
+    for row in rows:
+        issue = {}
+        for k in row.keys():
+            v = row[k]
+            if v is None or v == "": continue
+            if k == "priority":
+                issue[k] = int(v)
+            elif k in ("created_at","updated_at","closed_at") and v:
+                issue[k] = v if "T" in v else v.replace(" ","T")+"Z"
+            else:
+                issue[k] = v
+        issues.append(issue)
+    jsonl_path.write_text("\n".join(json.dumps(i) for i in issues) + "\n")
+    return len(issues)
+
+# ── main migration loop ────────────────────────────────────────────────────────
+
+print(f"\n{'─'*60}")
+print(f"  Migrating {len(id_to_repo)} issues to {len(assignments)} repos")
+if DRY_RUN: print("  DRY RUN MODE — no changes will be made")
+print(f"{'─'*60}\n")
+
+migrated_ids = []
+
+for repo, ids in assignments.items():
+    if repo not in REPO_INFO:
+        print(f"SKIP {repo}: not found on disk")
+        continue
+    info = REPO_INFO[repo]
+    repo_issues = [issue_map[i] for i in ids if i in issue_map]
+    missing = [i for i in ids if i not in issue_map]
+    if missing:
+        print(f"  WARN: {repo}: {len(missing)} IDs not found in beads_src: {missing[:5]}")
+
+    # deps where both sides are going to the same repo
+    repo_dep_ids = set(ids)
+    repo_deps = [d for d in all_deps
+                 if d.get("issue_id") in repo_dep_ids and d.get("depends_on_id") in repo_dep_ids]
+
+    print(f"{repo} ({info['backend']})  {len(repo_issues)} issues, {len(repo_deps)} internal deps")
+
+    if info["backend"] == "dolt":
+        insert_dolt(info["db"], repo_issues, repo_deps)
+        if not DRY_RUN:
+            n = regen_jsonl_dolt(info["db"], info["jsonl_path"])
+            print(f"  → JSONL updated ({n} total issues)")
+    else:
+        insert_sqlite(info["db_path"], repo_issues, repo_deps)
+        if not DRY_RUN:
+            n = regen_jsonl_sqlite(info["db_path"], info["jsonl_path"])
+            print(f"  → JSONL updated ({n} total issues)")
+
+    migrated_ids.extend(ids)
+    print()
+
+# ── delete from beads_src ─────────────────────────────────────────────────────
+
+if migrated_ids and not DRY_RUN:
+    quoted = ", ".join(f"'{i}'" for i in migrated_ids)
+    print(f"Deleting {len(migrated_ids)} issues from beads_src...")
+    mysql_exec(f"DELETE FROM issues WHERE id IN ({quoted})")
+    mysql_exec(f"DELETE FROM dependencies WHERE issue_id IN ({quoted}) OR depends_on_id IN ({quoted})")
+
+    # Regen ~/src JSONL
+    src_jsonl = Path.home() / "src/.beads/issues.jsonl"
+    n = regen_jsonl_dolt("beads_src", src_jsonl)
+    print(f"beads_src JSONL updated ({n} remaining issues)")
+
+    # Dolt commit for beads_src
+    subprocess.run(["bash","-c","cd ~/src && bd vc commit -m 'migrate: move issues to correct repos'"],
+                   capture_output=True)
+
+print(f"\nDone. {'(dry run)' if DRY_RUN else ''}")
